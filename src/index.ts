@@ -6,7 +6,6 @@ import { createHash } from "crypto"
 import type { Plugin } from "@opencode-ai/plugin"
 
 const HOME = homedir()
-const VENV_PYTHON = join(HOME, ".local/share/pipx/venvs/mempalace/bin/python3")
 const MEMPALACE_BIN = join(HOME, ".local/bin/mempalace")
 const OPENCODE_DB = join(HOME, ".local/share/opencode/opencode.db")
 const STATE_FILE = join(HOME, ".mempalace/sync_state.json")
@@ -14,15 +13,33 @@ const PLUGIN_CONFIG = join(HOME, ".mempalace/plugin-config.json")
 const IDENTITY_FILE = join(HOME, ".mempalace/identity.txt")
 const OUT_DIR = "/tmp/oc-sessions"
 const TMP_SCRIPT = "/tmp/oc-plugin-query.py"
-const DEBUG = !!process.env.OPENCODE_MEMPALACE_DEBUG
-const LOG_FILE = "/tmp/opencode-mempalace.log"
+const LOG_FILE = join(HOME, ".mempalace/logs/plugin.log")
 const MAX_INJECT_CHARS = 900
 const MAX_SEARCH_RESULTS = 3
 
+// mempalace is installed via `uv tool` (pipx venv path is legacy)
+function findPalacePython(): string {
+  const candidates = [
+    process.env.MEMPALACE_PYTHON,
+    join(HOME, ".local/share/uv/tools/mempalace/bin/python3"),
+    join(HOME, ".local/share/pipx/venvs/mempalace/bin/python3"),
+  ].filter(Boolean) as string[]
+  for (const p of candidates) {
+    try {
+      execSync(`"${p}" -c ""`, { stdio: "ignore" })
+      return p
+    } catch {}
+  }
+  return candidates[0] || "python3"
+}
+const VENV_PYTHON = findPalacePython()
+
 function log(msg: string) {
-  if (!DEBUG) return
   const ts = new Date().toISOString()
-  try { appendFileSync(LOG_FILE, `[${ts}] ${msg}\n`) } catch {}
+  try {
+    mkdirSync(join(HOME, ".mempalace/logs"), { recursive: true })
+    appendFileSync(LOG_FILE, `[${ts}] ${msg}\n`)
+  } catch {}
 }
 
 let miningLock = false
@@ -67,6 +84,21 @@ function mempalaceSearch(query: string): string {
     }).trim()
     if (!out || out.includes("No results")) return ""
     return out.slice(0, MAX_INJECT_CHARS)
+  } catch {
+    return ""
+  }
+}
+
+// Native L0+L1 wake-up context (identity, essential story, recent threads)
+function mempalaceWakeUp(): string {
+  try {
+    const out = execSync(`${MEMPALACE_BIN} wake-up`, {
+      encoding: "utf-8",
+      timeout: 15000,
+    }).trim()
+    if (!out) return ""
+    // Drop the "Wake-up text (~N tokens):" banner line
+    return out.replace(/^Wake-up text \([^)]+\):\s*\n/, "").slice(0, 3000)
   } catch {
     return ""
   }
@@ -220,12 +252,16 @@ export default (async () => {
 
       if (!wakeupDone) {
         wakeupDone = true
-        if (identity) {
+        // Prefer native wake-up (includes identity + L0/L1); fall back to identity file
+        const ctx = mempalaceWakeUp() || (identity
+          ? `[MemPalace Identity]\n${identity}\n[/MemPalace Identity]`
+          : "")
+        if (ctx) {
           injectParts.push({
-            id: `mp-identity-${Date.now()}`,
+            id: `mp-wakeup-${Date.now()}`,
             type: "text",
             synthetic: true,
-            text: `[MemPalace Identity]\n${identity}\n[/MemPalace Identity]`,
+            text: `[MemPalace Context]\n${ctx}\n[/MemPalace Context]`,
           })
         }
       }
