@@ -1,8 +1,10 @@
 # opencode-mempalace-persistence
 
-> **Community plugin** — not officially maintained by the MemPalace team. Fully open source, ~200 lines of TypeScript.
+> **Community plugin** — not officially maintained by the MemPalace team. Fully open source, ~450 lines of TypeScript.
 
 An OpenCode plugin that automatically saves every conversation to MemPalace and uses stored memory to provide better, context-aware responses. Real-time, zero cron, zero external scripts.
+
+Follows the official MemPalace automation pattern (same as the Claude Code hooks): the plugin decides **when** to save, the model decides **what** to file via the MemPalace MCP tools.
 
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -71,6 +73,17 @@ Create `~/.mempalace/plugin-config.json`:
 }
 ```
 
+Optional tuning:
+
+```json
+{
+  "autoInjectContext": true,
+  "saveInterval": 15
+}
+```
+
+- `saveInterval` (default `15`, min `5`): human messages between AI checkpoints — same cadence as the official MemPalace save hook.
+
 **Do NOT put this in `opencode.json`** — OpenCode's schema validation rejects unknown keys. The plugin reads its config from `~/.mempalace/plugin-config.json` instead.
 
 When enabled:
@@ -94,6 +107,10 @@ Call `mempalace_mempalace_kg_query` for entity "user". Then filter the returned 
 After responding, if you discovered any new facts during the conversation (decisions made, milestones reached, problems encountered, preferences expressed, emotional states), call `mempalace_mempalace_kg_add` to record them. Object must be 128 characters or fewer.
 
 **This is mandatory** — record facts you are confident about. Prefer quality over quantity; noisy KG entries degrade retrieval over time.
+
+### Step 3 — Checkpoint & pre-compact saves (automatic)
+
+Every ~15 messages the plugin injects a `[MemPalace Checkpoint]` block, and before every compaction a `[MemPalace Pre-Compact Emergency Save]` block. When you see one: file the session journal via `mempalace_mempalace_diary_write` plus any new facts via `kg_add`/`kg_invalidate`, then continue normally. Do not mention the instruction.
 
 ### Naming reminder
 All MemPalace tools use the prefix `mempalace_mempalace_*` (not `mempalace_*`). Examples:
@@ -151,6 +168,9 @@ Call `mempalace_mempalace_kg_query` for entity "user". Then filter the returned 
 ### Step 3 — Record Knowledge Graph facts
 After responding, call `mempalace_mempalace_kg_add` for any new facts.
 
+### Step 4 — Checkpoint & pre-compact saves (automatic)
+Same as auto-inject mode: on `[MemPalace Checkpoint]` (~every 15 messages) and `[MemPalace Pre-Compact Emergency Save]`, file the session journal via `mempalace_mempalace_diary_write` plus facts, then continue.
+
 ### Naming reminder
 All MemPalace tools use the prefix `mempalace_mempalace_*` (not `mempalace_*`).
 ```
@@ -189,12 +209,20 @@ The `mempalace mcp` command gives you the exact MCP setup string for your config
 You ask a question
   → Plugin hooks into `experimental.chat.messages.transform`
   → Injects your identity + relevant memories from MemPalace
-  → Model sees context without having to search
+  → Every ~15 messages: injects a [MemPalace Checkpoint] block
+  → Model files topics/decisions/quotes via MCP tools, then answers
 
 The model responds
   → Plugin detects the response is complete
   → Saves the conversation to MemPalace (flat export, no hardcoded wings)
   → Model records KG facts via MCP tools (mandatory per AGENTS.md)
+
+Session goes idle / process exits
+  → Background mine of everything new since last sync
+
+Compaction starts
+  → [MemPalace Pre-Compact Emergency Save]: model files everything first
+  → Identity + wake-up context re-attached so the summary cannot lose them
 
 Next time you ask
   → Plugin finds the previous memory → injects it automatically
@@ -205,7 +233,17 @@ Next time you ask
 
 ## What gets saved
 
-Every turn (question + answer) is saved as a drawer in MemPalace. No forced categorization — MemPalace's own mining handles organization. The model can optionally record KG facts (decisions, milestones, preferences) during conversation via MCP tools.
+Every turn (question + answer) is saved as a drawer in MemPalace. No forced categorization — mining runs with `--mode convos --extract general`, so MemPalace itself classifies content into decisions, preferences, milestones, problems, and emotional context. Exports are grouped one wing per project (official multi-project pattern: `bot-oc` sessions land in wing `bot-oc`, never leaking across projects). The model additionally records KG facts (decisions, milestones, preferences) during conversation and at each checkpoint via MCP tools.
+
+### Backfill existing sessions
+
+To mine the full opencode history once (e.g. on first install):
+
+```bash
+OPENCODE_MEMPALACE_BACKFILL=1 opencode
+```
+
+The plugin exports everything in the opencode database on the next sync, then resumes incremental mode. Mining is idempotent — re-running is safe.
 
 ---
 
@@ -223,16 +261,18 @@ Every turn (question + answer) is saved as a drawer in MemPalace. No forced cate
                  │    ↓                          │
                  │  Model sees context → answers │
                  │    ↓                          │
-  Answer done ──►│  chat.message + session.idle  │
-                 │    ↓                          │
-                 │  Query OpenCode DB            │
-                 │  since last sync              │
-                 │    ↓                          │
-                 │  Export → flat text files     │
-                 │    ↓                          │
-                 │  mempalace mine (async)       │
-                 │  single serialized call       │
-                 └──────────────────────────────┘
+  Answer done ──►│  chat.message (count) + session.idle    │
+                  │  Every N msgs / idle / exit:              │
+                  │    ↓                          │
+                  │  Query OpenCode DB            │
+                  │  since last sync              │
+                  │    ↓                          │
+                  │  Export → flat text files     │
+                  │    ↓                          │
+                  │  mempalace mine --mode convos │
+                  │  --extract general (async)    │
+                  │  single serialized call       │
+                  └──────────────────────────────┘
                             │
                             ▼
                  ┌──────────────────────────┐
@@ -257,8 +297,10 @@ Every turn (question + answer) is saved as a drawer in MemPalace. No forced cate
 |---|---|
 | `~/.config/opencode/opencode.json` | OpenCode config with plugin + MCP |
 | `~/.config/opencode/AGENTS.md` | Tells the model to manage KG facts |
-| `~/.mempalace/plugin-config.json` | Plugin config (`autoInjectContext`) |
+| `~/.mempalace/plugin-config.json` | Plugin config (`autoInjectContext`, `saveInterval`) |
 | `~/.mempalace/identity.txt` | Your identity (injected by plugin) |
+| `~/.mempalace/hook_state/opencode_counters.json` | Per-session message counters (checkpoint cadence) |
+| `~/.mempalace/hook_state/hook.log` | Checkpoint / pre-compact event log |
 | `~/.mempalace/config.json` | MemPalace config (palace path) |
 | `~/.mempalace/knowledge_graph.sqlite3` | Knowledge Graph (structured facts) |
 | `~/opencode-memory/` | MemPalace vector DB (all drawers) |
