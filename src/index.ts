@@ -1,4 +1,4 @@
-import { execSync, exec, spawnSync } from "child_process"
+import { execSync, execFileSync, execFile, spawnSync } from "child_process"
 import { existsSync, readFileSync, writeFileSync, mkdirSync, rmdirSync, unlinkSync, appendFileSync } from "fs"
 import { homedir } from "os"
 import { join } from "path"
@@ -6,7 +6,6 @@ import { createHash } from "crypto"
 import type { Plugin } from "@opencode-ai/plugin"
 
 const HOME = homedir()
-const VENV_PYTHON = join(HOME, ".local/share/pipx/venvs/mempalace/bin/python3")
 const MEMPALACE_BIN = join(HOME, ".local/bin/mempalace")
 const OPENCODE_DB = join(HOME, ".local/share/opencode/opencode.db")
 const STATE_FILE = join(HOME, ".mempalace/sync_state.json")
@@ -38,6 +37,43 @@ function hookLog(msg: string) {
   } catch {}
 }
 
+// Errors are never silent: hook.log is always written (unlike the
+// DEBUG-gated log), so a broken pipeline is visible by default.
+function errLog(msg: string) {
+  log("ERROR: " + msg)
+  hookLog("ERROR: " + msg)
+}
+
+// Probe for a working Python interpreter at startup instead of hardcoding
+// one installer layout (pipx vs uv tool vs system). runPython only needs
+// stdlib (sqlite3/json), so any python3 works. Priority: explicit env
+// override, legacy pipx venv, uv tool venv, PATH fallback.
+let resolvedPython: string | null | undefined = undefined
+function resolvePython(): string | null {
+  if (resolvedPython !== undefined) return resolvedPython
+  const candidates = [
+    process.env.MEMPALACE_PYTHON,
+    join(HOME, ".local/share/pipx/venvs/mempalace/bin/python3"),
+    join(HOME, ".local/share/uv/tools/mempalace/bin/python3"),
+  ].filter((p): p is string => !!p && existsSync(p))
+  if (candidates.length > 0) {
+    resolvedPython = candidates[0]
+  } else {
+    try {
+      execSync("python3 --version", { encoding: "utf-8", timeout: 10000 })
+      resolvedPython = "python3"
+    } catch {
+      resolvedPython = null
+    }
+  }
+  if (resolvedPython) {
+    log("using python: " + resolvedPython)
+  } else {
+    errLog("no working Python interpreter found (tried MEMPALACE_PYTHON, pipx venv, uv tool venv, PATH python3) — DB export disabled")
+  }
+  return resolvedPython
+}
+
 let miningLock = false
 let lastSyncTs = 0
 let wakeupDone = false
@@ -47,11 +83,14 @@ let wakeupDone = false
 let pendingCheckpoint: { sessionID: string; count: number } | null = null
 
 function runPython(code: string): string {
+  const python = resolvePython()
+  if (!python) throw new Error("no working Python interpreter (see hook.log)")
   writeFileSync(TMP_SCRIPT, code)
   try {
-    return execSync(`${VENV_PYTHON} ${TMP_SCRIPT}`, { encoding: "utf-8", timeout: 30000 }).trim()
+    // argv array, no shell (see PR #2): paths here are fixed, never user input.
+    return execFileSync(python, [TMP_SCRIPT], { encoding: "utf-8", timeout: 30000 }).trim()
   } finally {
-    unlinkSync(TMP_SCRIPT)
+    try { unlinkSync(TMP_SCRIPT) } catch {}
   }
 }
 
@@ -99,7 +138,8 @@ function persistCounters(counters: Record<string, SessionCounter>): void {
 
 function mempalaceWakeup(): string {
   try {
-    const out = execSync(`${MEMPALACE_BIN} wake-up`, { encoding: "utf-8", timeout: 15000 }).trim()
+    // argv array, no shell.
+    const out = execFileSync(MEMPALACE_BIN, ["wake-up"], { encoding: "utf-8", timeout: 15000 }).trim()
     if (!out) return ""
     return out.slice(0, MAX_WAKEUP_CHARS)
   } catch {
@@ -129,7 +169,9 @@ function readIdentity(): string {
 
 function mempalaceSearch(query: string): string {
   try {
-    const out = execSync(`${MEMPALACE_BIN} search "${query.replace(/"/g, '\\"')}" --results ${MAX_SEARCH_RESULTS}`, {
+    // argv array, no shell (see PR #2): the query is raw user message
+    // text, so it must never pass through /bin/sh. No manual escaping needed.
+    const out = execFileSync(MEMPALACE_BIN, ["search", query, "--results", String(MAX_SEARCH_RESULTS)], {
       encoding: "utf-8",
       timeout: 15000,
     }).trim()
@@ -147,7 +189,7 @@ function getLastSync(): number {
 
 function dbSync(): void {
   if (miningLock) return
-  try { doDbSync() } catch (e) { log("sync err: " + String(e)) }
+  try { doDbSync() } catch (e) { errLog("sync err: " + String(e)) }
 }
 
 function backfillRequested(): boolean {
@@ -253,8 +295,10 @@ function markSynced(now: number): void {
 // Official classification: decisions, preferences, milestones, problems,
 // emotional context. Agent tag keeps opencode-mined drawers attributable.
 // One wing per project (official multi-project pattern).
-function mineCommand(wingDir: string, wing: string): string {
-  return `${MEMPALACE_BIN} mine ${wingDir} --mode convos --extract general --agent opencode --wing ${wing}`
+// Argv array, no shell (see PR #2): wing names are sanitized, but the
+// spawn path stays shell-free regardless.
+function mineArgs(wingDir: string, wing: string): string[] {
+  return ["mine", wingDir, "--mode", "convos", "--extract", "general", "--agent", "opencode", "--wing", wing]
 }
 
 function cleanupExport(wings: Map<string, string[]>): void {
@@ -300,11 +344,14 @@ function doDbSync(): void {
       return
     }
     const [wing, files] = entries[i]
-    exec(mineCommand(join(OUT_DIR, wing), wing), {
+    // No timeout here by design (see PR #4): Node would kill only the
+    // wrapper shell and orphan the python mine process, which keeps
+    // holding the palace lock while the next mine piles up. miningLock
+    // already serializes concurrent mines; long mines run to completion.
+    execFile(MEMPALACE_BIN, mineArgs(join(OUT_DIR, wing), wing), {
       encoding: "utf-8",
-      timeout: 300000,
     }, (err) => {
-      if (err) { miningLock = false; log(`mine err (${wing}): ${err.message}`); return }
+      if (err) { miningLock = false; errLog(`mine err (${wing}): ${err.message}`); return }
       log(`mined wing ${wing} (${files.length} sessions)`)
       mineNext(i + 1)
     })
@@ -320,16 +367,16 @@ function exitSync(): void {
     if (wings.size === 0) return
     for (const [wing] of wings) {
       log(`exit save: mining wing ${wing}`)
-      const res = spawnSync(MEMPALACE_BIN, ["mine", join(OUT_DIR, wing), "--mode", "convos", "--extract", "general", "--agent", "opencode", "--wing", wing], {
+      const res = spawnSync(MEMPALACE_BIN, mineArgs(join(OUT_DIR, wing), wing), {
         encoding: "utf-8",
         timeout: 60000,
       })
-      if (res.error || res.status !== 0) { log(`exit mine err (${wing}): ${String(res.error || res.status)}`); return }
+      if (res.error || res.status !== 0) { errLog(`exit mine err (${wing}): ${String(res.error || res.status)}`); return }
     }
     markSynced(now)
     cleanupExport(wings)
     log("exit save done")
-  } catch (e) { log("exit save err: " + String(e)) }
+  } catch (e) { errLog("exit save err: " + String(e)) }
 }
 
 export default (async () => {
