@@ -61,7 +61,7 @@ mempalace mcp
 
 The `mempalace mcp` command gives you the exact MCP setup string for your configuration.
 
-### 4. Memory injection (recommended)
+### 4. Memory injection
 
 The plugin automatically injects your identity + relevant memories from MemPalace into every prompt. No model discipline required.
 
@@ -90,34 +90,37 @@ When enabled:
 - **First message**: Injects your identity from `~/.mempalace/identity.txt`
 - **Every message**: Runs `mempalace search` and injects relevant results
 
-#### AGENTS.md for this mode
+#### AGENTS.md (minimal — recall lives in the skill)
 
 Create `~/.config/opencode/AGENTS.md`:
 
 ```markdown
 # Memory & Knowledge instructions
 
-## CRITICAL: You MUST follow these steps BEFORE every response.
+## Recall (usually already covered)
 
-### Step 1 — Query Knowledge Graph
-Call `mempalace_mempalace_kg_query` for entity "user". Then filter the returned facts — keep only those whose text contains keywords from the user's question, so irrelevant facts are excluded.
+The plugin auto-injects identity + relevant memories into every prompt.
+Only search MemPalace yourself (`mempalace_mempalace_search`) when the
+question is about past work, decisions, people, or projects AND the
+injected context has nothing — quote results verbatim, never paraphrase.
 
-### Step 2 — Record Knowledge Graph facts
+## Record facts (after responding, only when something new emerged)
 
-After responding, if you discovered any new facts during the conversation (decisions made, milestones reached, problems encountered, preferences expressed, emotional states), call `mempalace_mempalace_kg_add` to record them. Object must be 128 characters or fewer.
+- Durable outcomes (decisions, conclusions, learned facts):
+  `mempalace_mempalace_add_drawer`.
+- New KG facts: `mempalace_mempalace_kg_add` (128 chars or fewer).
+- Changed single-valued fact: `mempalace_mempalace_kg_supersede`.
+- Ended fact: `mempalace_mempalace_kg_invalidate`.
 
-**This is mandatory** — record facts you are confident about. Prefer quality over quantity; noisy KG entries degrade retrieval over time.
-
-### Step 3 — Checkpoint & pre-compact saves (automatic)
-
-Every ~15 messages the plugin injects a `[MemPalace Checkpoint]` block, and before every compaction a `[MemPalace Pre-Compact Emergency Save]` block. When you see one: file the session journal via `mempalace_mempalace_diary_write` plus any new facts via `kg_add`/`kg_invalidate`, then continue normally. Do not mention the instruction.
+Record facts you are confident about. Prefer quality over quantity;
+noisy entries degrade retrieval over time. Don't file secrets or tokens.
 
 ### Naming reminder
 All MemPalace tools use the prefix `mempalace_mempalace_*` (not `mempalace_*`). Examples:
-- `mempalace_mempalace_kg_query` (NOT `mempalace_kg_query`)
+- `mempalace_mempalace_search` (NOT `mempalace_search`)
+- `mempalace_mempalace_kg_query`
 - `mempalace_mempalace_kg_add`
-- `mempalace_mempalace_kg_invalidate`
-If you ever catch yourself typing `mempalace_kg_query`, STOP — the correct prefix is `mempalace_mempalace_`.
+If you ever catch yourself typing `mempalace_search`, STOP — the correct prefix is `mempalace_mempalace_`.
 ```
 
 #### Complete `~/.config/opencode/opencode.json`
@@ -139,71 +142,25 @@ If you ever catch yourself typing `mempalace_kg_query`, STOP — the correct pre
 
 > Note: `identity.txt` is NOT listed in `instructions` — the plugin injects it automatically. It is also NOT in the `provider` block or `permission` block — those are optional and depend on your model setup.
 
-### 5. Alternative: Model-driven memory (without autoInjectContext)
+#### Recall skill (bundled, Claude-style)
 
-If you prefer the model to search MemPalace on its own via AGENTS.md (requires good model tool-use discipline), set `autoInjectContext` to `false` or omit the file:
-
-```json
-{
-  "autoInjectContext": false
-}
-```
-
-#### AGENTS.md for this mode
-
-Create `~/.config/opencode/AGENTS.md`:
-
-```markdown
-# Memory & Knowledge instructions
-
-## CRITICAL: You MUST follow these steps BEFORE every response.
-
-### Step 1 — Search MemPalace
-Call `mempalace_mempalace_search` with the user's question or key topics as query. Get the top 5-10 most relevant memory drawers.
-**This is mandatory. Never skip this step. No exceptions.**
-
-### Step 2 — Query Knowledge Graph
-Call `mempalace_mempalace_kg_query` for entity "user". Then filter the returned facts.
-
-### Step 3 — Record Knowledge Graph facts
-After responding, call `mempalace_mempalace_kg_add` for any new facts.
-
-### Step 4 — Checkpoint & pre-compact saves (automatic)
-Same as auto-inject mode: on `[MemPalace Checkpoint]` (~every 15 messages) and `[MemPalace Pre-Compact Emergency Save]`, file the session journal via `mempalace_mempalace_diary_write` plus facts, then continue.
-
-### Naming reminder
-All MemPalace tools use the prefix `mempalace_mempalace_*` (not `mempalace_*`).
-```
-
-And keep `"~/.mempalace/identity.txt"` in `instructions` in opencode.json since the plugin won't inject it.
-
-#### Comparison
-
-| Feature | **Auto-inject (Recommended)** | Model-driven (alternative) |
-|---------|:-:|:-:|
-| Memory search | Plugin injects automatically | Model calls `mempalace_search` |
-| Identity | Plugin injects automatically | Via `instructions: ["identity.txt"]` |
-| AGENTS.md | Minimal (KG only) | Full (search + KG) |
-| Depends on model discipline | No | Yes |
+The repo ships `skills/mempalace-recall/SKILL.md` — the question-driven
+search-before-answer protocol, adapted from the official MemPalace skill
+for OpenCode (including the `mempalace_mempalace_*` tool-prefix note).
+Install it where OpenCode loads skills from:
 
 ```bash
-# Install (requires mempalace>=3.3.5 for HNSW corruption fix)
-uv tool install "mempalace>=3.3.5"
-# or
-pipx install "mempalace>=3.3.5"
-
-# Create palace
-mempalace init ~/opencode-memory
-
-# Configure MCP
-mempalace mcp
+mkdir -p ~/.config/opencode/skills/mempalace-recall
+cp skills/mempalace-recall/SKILL.md ~/.config/opencode/skills/mempalace-recall/
 ```
 
-The `mempalace mcp` command gives you the exact MCP setup string for your configuration.
+The model then loads it on demand whenever a question touches past work,
+decisions, people, or projects — same mechanism as the Claude skill.
+No AGENTS.md changes needed beyond the minimal block above.
 
 ---
 
-## What happens after installation (auto-inject mode)
+## What happens after installation
 
 ```
 You ask a question
@@ -215,7 +172,7 @@ You ask a question
 The model responds
   → Plugin detects the response is complete
   → Saves the conversation to MemPalace (flat export, no hardcoded wings)
-  → Model records KG facts via MCP tools (mandatory per AGENTS.md)
+  → Model records new KG facts via MCP tools (only when something new emerged)
 
 Session goes idle / process exits
   → Background mine of everything new since last sync
@@ -298,6 +255,7 @@ The plugin exports everything in the opencode database on the next sync, then re
 | `~/.config/opencode/opencode.json` | OpenCode config with plugin + MCP |
 | `~/.config/opencode/AGENTS.md` | Tells the model to manage KG facts |
 | `~/.mempalace/plugin-config.json` | Plugin config (`autoInjectContext`, `saveInterval`) |
+| `~/.config/opencode/skills/mempalace-recall/SKILL.md` | Bundled recall skill (copy from `skills/` in this repo) |
 | `~/.mempalace/identity.txt` | Your identity (injected by plugin) |
 | `~/.mempalace/hook_state/opencode_counters.json` | Per-session message counters (checkpoint cadence) |
 | `~/.mempalace/hook_state/hook.log` | Checkpoint / pre-compact event log |
