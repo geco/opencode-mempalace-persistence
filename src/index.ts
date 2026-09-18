@@ -1,5 +1,5 @@
 import { execSync, execFileSync, execFile, spawnSync } from "child_process"
-import { existsSync, readFileSync, writeFileSync, mkdirSync, rmdirSync, unlinkSync, appendFileSync, statSync } from "fs"
+import { existsSync, readFileSync, writeFileSync, mkdirSync, rmdirSync, unlinkSync, appendFileSync, statSync, readdirSync } from "fs"
 import { homedir } from "os"
 import { join, dirname } from "path"
 import { createHash } from "crypto"
@@ -100,6 +100,23 @@ function pluginVersion(): string {
     cachedVersion = typeof pkg?.version === "string" ? pkg.version : "unknown"
   } catch { cachedVersion = "unknown" }
   return cachedVersion ?? "unknown"
+}
+
+// Pending export files (backlog). Pure fs walk, no shell.
+function countPendingFiles(): number {
+  let n = 0
+  try {
+    for (const w of readdirSync(SYNC_DIR, { withFileTypes: true })) {
+      if (!w.isDirectory()) continue
+      try { n += readdirSync(join(SYNC_DIR, w.name)).length } catch {}
+    }
+  } catch {}
+  return n
+}
+
+function countPendingSuffix(): string {
+  const pending = countPendingFiles()
+  return pending > 0 ? `, ${pending} file(s) waiting to mine` : ", queue empty"
 }
 
 // TUI toast client (set by the factory). Fire-and-forget: headless runs
@@ -485,6 +502,12 @@ function doDbSync(): void {
   log(`mining ${wingCount(wings)} sessions across ${wings.size} wings`)
 
   const entries = [...wings.entries()]
+  // Per-wing drawers tally for the final toast (parsed from mine stdout).
+  const wingDrawers = new Map<string, number>()
+  const parseDrawers = (stdout: unknown): number => {
+    const m = String(stdout || "").match(/Drawers filed:\s*(\d+)/i)
+    return m ? parseInt(m[1], 10) : 0
+  }
   // Retry schedule for lock contention: two instances (or an MCP write)
   // interleave wing by wing instead of starving each other. Total ~10min
   // of retries per wing, then give up until the next trigger (idle/exit).
@@ -501,8 +524,10 @@ function doDbSync(): void {
       cleanupExport(wings)
       log("mine done")
       const names = [...wings.keys()].join(", ")
-      toast("success", "MemPalace", `mined ${wingCount(wings)} session(s) → ${names}`)
-      ilog("mine", { outcome: "ok", sessions: wingCount(wings), wings: [...wings.keys()] })
+      const totalDrawers = [...wingDrawers.values()].reduce((a, b) => a + b, 0)
+      const detail = totalDrawers > 0 ? ` (${totalDrawers} drawers)` : ""
+      toast("success", "MemPalace", `mined ${wingCount(wings)} session(s) → ${names}${detail}`)
+      ilog("mine", { outcome: "ok", sessions: wingCount(wings), wings: [...wings.keys()], drawers: totalDrawers })
       return
     }
     const [wing, files] = entries[i]
@@ -514,7 +539,7 @@ function doDbSync(): void {
     if (!bin) { miningLock = false; errLog("mine skipped: mempalace CLI not found"); return }
     execFile(bin, mineArgs(join(OUT_DIR, wing), wing), {
       encoding: "utf-8",
-    }, (err) => {
+    }, (err, stdout) => {
       if (err) {
         const msg = err.message || String(err)
         // Lock contention (second opencode instance mining, or an MCP
@@ -545,6 +570,11 @@ function doDbSync(): void {
         return
       }
       log(`mined wing ${wing} (${files.length} sessions)`)
+      wingDrawers.set(wing, parseDrawers(stdout))
+      // Truthful progress: one toast per completed wing (an exact % is
+      // impossible — the mine CLI is a black box with ~4s startup cost
+      // per invocation, so per-file mines would only add overhead).
+      toast("info", "MemPalace", `wing ${wing} done (${i + 1}/${entries.length})`)
       mineNext(i + 1)
     })
   }
@@ -595,14 +625,17 @@ export default (async ({ client }: any) => {
   setTimeout(() => dbSync(), 10000)
 
   // Startup toast (delayed so the TUI is attached): shows exactly which
-  // plugin build is loaded — no more guessing npm-cache vs local build.
+  // plugin build is loaded — no more guessing npm-cache vs local build —
+  // plus pending backlog so a restarted-into-backlog state is visible.
   setTimeout(() => {
-    toast("info", "MemPalace", `${pluginName()} v${pluginVersion()} loaded`)
+    toast("info", "MemPalace", `${pluginName()} v${pluginVersion()} loaded${countPendingSuffix()}`)
     log(`startup toast fired (${pluginName()} v${pluginVersion()})`)
   }, 15000)
 
   // Crash safety: best-effort synchronous save on hard exit.
   // Mirrors the official emergency-save intent (nothing async allowed here).
+  // SIGHUP included: closing the terminal / dropping SSH kills the process
+  // group, otherwise mines would die mid-run with no save attempt.
   let exitHandled = false
   const onExit = () => {
     if (exitHandled) return
@@ -611,6 +644,7 @@ export default (async ({ client }: any) => {
   }
   process.once("SIGINT", onExit)
   process.once("SIGTERM", onExit)
+  process.once("SIGHUP", onExit)
   process.once("exit", onExit)
 
   return {
