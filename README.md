@@ -188,9 +188,11 @@ shows the loaded plugin version (`plugin v2.x loaded`), so you always know
 whether you're running the npm release or a local build.
 
 Multiple opencode instances are supported: mines coordinate through the
-palace lock — while one instance mines, the others skip quietly (one info
-toast every 5 minutes max) and retry on the next trigger. To reduce
-contention, prefer a single instance during large backfills.
+palace lock with backoff-and-retry (up to ~10min per wing), so concurrent
+instances interleave wing by wing instead of starving each other — backfills
+complete even with two sessions open. Routine contention shows one info
+toast every 5 minutes max. To reduce contention during huge backfills, a
+single instance is still fastest.
 
 Compaction starts
   → [MemPalace Pre-Compact Emergency Save]: model files everything first

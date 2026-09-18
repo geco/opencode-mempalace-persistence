@@ -449,7 +449,13 @@ function doDbSync(): void {
   log(`mining ${wingCount(wings)} sessions across ${wings.size} wings`)
 
   const entries = [...wings.entries()]
-  const mineNext = (i: number): void => {
+  // Retry schedule for lock contention: two instances (or an MCP write)
+  // interleave wing by wing instead of starving each other. Total ~10min
+  // of retries per wing, then give up until the next trigger (idle/exit).
+  // miningLock stays held during backoff so one process never piles up.
+  const RETRY_DELAYS_MS = [15000, 30000, 60000, 120000, 180000, 300000]
+  const jitter = (ms: number) => ms + Math.floor(Math.random() * 10000)
+  const mineNext = (i: number, attempt = 0): void => {
     if (i >= entries.length) {
       miningLock = false
       // Advance state only on full success: on failure the same
@@ -473,19 +479,26 @@ function doDbSync(): void {
       encoding: "utf-8",
     }, (err) => {
       if (err) {
-        miningLock = false
         const msg = err.message || String(err)
-        // Lock contention (usually a second opencode instance mining, or
-        // an MCP write in flight) is routine, not a failure: stay quiet
-        // in hook.log and retry at the next trigger. Anything else is a
-        // real error.
-        if (/is held by/i.test(msg)) {
-          log(`mine skipped, palace busy (${wing}) — retrying next sync`)
+        // Lock contention (second opencode instance mining, or an MCP
+        // write in flight) is routine, not a failure: back off and retry
+        // the same wing — the holder releases between its own wings, so
+        // concurrent instances interleave instead of starving. Anything
+        // else is a real error.
+        if (/is held by/i.test(msg) && attempt < RETRY_DELAYS_MS.length) {
+          const wait = jitter(RETRY_DELAYS_MS[attempt])
+          log(`palace busy (${wing}), retry ${attempt + 1}/${RETRY_DELAYS_MS.length} in ${Math.round(wait / 1000)}s`)
           const nowTs = Date.now()
           if (nowTs - lastBusyToastTs > BUSY_TOAST_WINDOW_MS) {
             lastBusyToastTs = nowTs
-            toast("info", "MemPalace", "palace busy (another instance mining?) — retrying next sync")
+            toast("info", "MemPalace", "palace busy (another instance mining?) — backing off, will retry")
           }
+          setTimeout(() => mineNext(i, attempt + 1), wait)
+          return
+        }
+        miningLock = false
+        if (/is held by/i.test(msg)) {
+          log(`mine skipped, palace busy (${wing}) after ${attempt} retries — next trigger will retry`)
           return
         }
         errLog(`mine err (${wing}): ${msg}`)
