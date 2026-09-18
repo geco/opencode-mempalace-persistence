@@ -1,8 +1,9 @@
 import { execSync, execFileSync, execFile, spawnSync } from "child_process"
 import { existsSync, readFileSync, writeFileSync, mkdirSync, rmdirSync, unlinkSync, appendFileSync } from "fs"
 import { homedir } from "os"
-import { join } from "path"
+import { join, dirname } from "path"
 import { createHash } from "crypto"
+import { fileURLToPath } from "url"
 import type { Plugin } from "@opencode-ai/plugin"
 
 const HOME = homedir()
@@ -56,9 +57,25 @@ function toastsEnabled(): boolean {
   return true
 }
 
+// Plugin's own version (shown in the startup toast and /memory-status).
+let cachedVersion: string | undefined = undefined
+function pluginVersion(): string {
+  if (cachedVersion !== undefined) return cachedVersion
+  try {
+    const here = dirname(fileURLToPath(import.meta.url))
+    const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf-8")) as any
+    cachedVersion = typeof pkg?.version === "string" ? pkg.version : "unknown"
+  } catch { cachedVersion = "unknown" }
+  return cachedVersion ?? "unknown"
+}
+
 // TUI toast client (set by the factory). Fire-and-forget: headless runs
 // (`opencode run`, no TUI attached) must never break on this.
 let tuiClient: any = null
+// Throttle for routine skip notices (busy palace): at most one toast
+// per window, otherwise active sessions get spammed every turn.
+let lastBusyToastTs = 0
+const BUSY_TOAST_WINDOW_MS = 5 * 60 * 1000
 function toast(variant: "info" | "success" | "warning" | "error", title: string, message: string): void {
   if (!toastsEnabled() || !tuiClient?.tui?.showToast) return
   try {
@@ -457,8 +474,22 @@ function doDbSync(): void {
     }, (err) => {
       if (err) {
         miningLock = false
-        errLog(`mine err (${wing}): ${err.message}`)
-        toast("error", "MemPalace", `mine failed (${wing}): ${err.message.slice(0, 120)}`)
+        const msg = err.message || String(err)
+        // Lock contention (usually a second opencode instance mining, or
+        // an MCP write in flight) is routine, not a failure: stay quiet
+        // in hook.log and retry at the next trigger. Anything else is a
+        // real error.
+        if (/is held by/i.test(msg)) {
+          log(`mine skipped, palace busy (${wing}) — retrying next sync`)
+          const nowTs = Date.now()
+          if (nowTs - lastBusyToastTs > BUSY_TOAST_WINDOW_MS) {
+            lastBusyToastTs = nowTs
+            toast("info", "MemPalace", "palace busy (another instance mining?) — retrying next sync")
+          }
+          return
+        }
+        errLog(`mine err (${wing}): ${msg}`)
+        toast("error", "MemPalace", `mine failed (${wing}): ${msg.slice(0, 120)}`)
         return
       }
       log(`mined wing ${wing} (${files.length} sessions)`)
@@ -510,6 +541,13 @@ export default (async ({ client }: any) => {
   // Catch anything missed by a previous run (e.g. content skipped when
   // the exit budget ran out). Fires once per server lifetime.
   setTimeout(() => dbSync(), 10000)
+
+  // Startup toast (delayed so the TUI is attached): shows exactly which
+  // plugin version is loaded — no more guessing npm-cache vs local build.
+  setTimeout(() => {
+    toast("info", "MemPalace", `plugin v${pluginVersion()} loaded`)
+    log(`startup toast fired (v${pluginVersion()})`)
+  }, 15000)
 
   // Crash safety: best-effort synchronous save on hard exit.
   // Mirrors the official emergency-save intent (nothing async allowed here).

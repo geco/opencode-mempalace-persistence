@@ -183,7 +183,14 @@ Session goes idle / process exits
 
 Every MemPalace call — plugin searches, model MCP calls (search, diary,
 KG) — also raises a short TUI toast with what was asked and a result
-preview, so background memory activity is always visible.
+preview, so background memory activity is always visible. A startup toast
+shows the loaded plugin version (`plugin v2.x loaded`), so you always know
+whether you're running the npm release or a local build.
+
+Multiple opencode instances are supported: mines coordinate through the
+palace lock — while one instance mines, the others skip quietly (one info
+toast every 5 minutes max) and retry on the next trigger. To reduce
+contention, prefer a single instance during large backfills.
 
 Compaction starts
   → [MemPalace Pre-Compact Emergency Save]: model files everything first
