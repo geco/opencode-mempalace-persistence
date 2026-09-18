@@ -57,8 +57,19 @@ function toastsEnabled(): boolean {
   return true
 }
 
-// Plugin's own version (shown in the startup toast and /memory-status).
+// Plugin's own name + version (shown in the startup toast and
+// /memory-status, so you always know which build is loaded).
+let cachedName: string | undefined = undefined
 let cachedVersion: string | undefined = undefined
+function pluginName(): string {
+  if (cachedName !== undefined) return cachedName
+  try {
+    const here = dirname(fileURLToPath(import.meta.url))
+    const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf-8")) as any
+    cachedName = typeof pkg?.name === "string" ? pkg.name : "opencode-mempalace-persistence"
+  } catch { cachedName = "opencode-mempalace-persistence" }
+  return cachedName ?? "opencode-mempalace-persistence"
+}
 function pluginVersion(): string {
   if (cachedVersion !== undefined) return cachedVersion
   try {
@@ -556,10 +567,10 @@ export default (async ({ client }: any) => {
   setTimeout(() => dbSync(), 10000)
 
   // Startup toast (delayed so the TUI is attached): shows exactly which
-  // plugin version is loaded — no more guessing npm-cache vs local build.
+  // plugin build is loaded — no more guessing npm-cache vs local build.
   setTimeout(() => {
-    toast("info", "MemPalace", `plugin v${pluginVersion()} loaded`)
-    log(`startup toast fired (v${pluginVersion()})`)
+    toast("info", "MemPalace", `${pluginName()} v${pluginVersion()} loaded`)
+    log(`startup toast fired (${pluginName()} v${pluginVersion()})`)
   }, 15000)
 
   // Crash safety: best-effort synchronous save on hard exit.
