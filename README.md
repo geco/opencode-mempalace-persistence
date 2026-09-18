@@ -177,7 +177,8 @@ The model responds
   → Model records new KG facts via MCP tools (only when something new emerged)
 
 Session goes idle / process exits
-  → Background mine of everything new since last sync
+  → Background mine of everything new since last sync (per-wing cursors:
+  each wing advances independently, so one slow wing never stalls the rest)
   → TUI toast confirms what was mined (disable with `"toasts": false`)
 
 Every MemPalace call — plugin searches, model MCP calls (search, diary,
