@@ -79,8 +79,22 @@ function toastsEnabled(): boolean {
   return true
 }
 
-// Plugin's own name + version (shown in the startup toast and
-// /memory-status, so you always know which build is loaded).
+// Messages arrived after the sync cursor: still waiting for the next run.
+function countPendingMessages(sinceMs: number): number {
+  try {
+    const out = runPython(`
+import sqlite3
+db = sqlite3.connect(${JSON.stringify(OPENCODE_DB)})
+n = db.execute("SELECT COUNT(*) FROM message WHERE time_created > ${sinceMs}").fetchone()[0]
+db.close()
+print(n)
+`)
+    const n = parseInt(out.trim(), 10)
+    return isNaN(n) ? 0 : n
+  } catch {
+    return 0
+  }
+}
 let cachedName: string | undefined = undefined
 let cachedVersion: string | undefined = undefined
 function pluginName(): string {
@@ -526,8 +540,11 @@ function doDbSync(): void {
       const names = [...wings.keys()].join(", ")
       const totalDrawers = [...wingDrawers.values()].reduce((a, b) => a + b, 0)
       const detail = totalDrawers > 0 ? ` (${totalDrawers} drawers)` : ""
-      toast("success", "MemPalace", `mined ${wingCount(wings)} session(s) → ${names}${detail}`)
-      ilog("mine", { outcome: "ok", sessions: wingCount(wings), wings: [...wings.keys()], drawers: totalDrawers })
+      // Anything that arrived while this mine was running stays pending.
+      const remaining = countPendingMessages(now)
+      const tail = remaining > 0 ? `, ${remaining} message(s) still waiting` : ", queue empty"
+      toast("success", "MemPalace", `mined ${wingCount(wings)} session(s) → ${names}${detail}${tail}`)
+      ilog("mine", { outcome: "ok", sessions: wingCount(wings), wings: [...wings.keys()], drawers: totalDrawers, remaining })
       return
     }
     const [wing, files] = entries[i]
