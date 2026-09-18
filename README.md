@@ -179,6 +179,7 @@ The model responds
 
 Session goes idle / process exits
   → Background mine of everything new since last sync
+  → TUI toast confirms what was mined (disable with `"toasts": false`)
 
 Compaction starts
   → [MemPalace Pre-Compact Emergency Save]: model files everything first

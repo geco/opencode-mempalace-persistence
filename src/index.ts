@@ -47,6 +47,26 @@ function errLog(msg: string) {
   hookLog("ERROR: " + msg)
 }
 
+function toastsEnabled(): boolean {
+  try {
+    const raw = readFileSync(PLUGIN_CONFIG, "utf-8")
+    const v = (JSON.parse(raw) as any)?.toasts
+    if (v === false) return false
+  } catch {}
+  return true
+}
+
+// TUI toast client (set by the factory). Fire-and-forget: headless runs
+// (`opencode run`, no TUI attached) must never break on this.
+let tuiClient: any = null
+function toast(variant: "info" | "success" | "warning" | "error", title: string, message: string): void {
+  if (!toastsEnabled() || !tuiClient?.tui?.showToast) return
+  try {
+    const p = tuiClient.tui.showToast({ body: { title, message, variant, duration: 5000 } })
+    if (p && typeof p.catch === "function") p.catch(() => {})
+  } catch {}
+}
+
 // Probe for a working Python interpreter at startup instead of hardcoding
 // one installer layout (pipx vs uv tool vs system). runPython only needs
 // stdlib (sqlite3/json), so any python3 works. Priority: explicit env
@@ -399,6 +419,8 @@ function doDbSync(): void {
       markSynced(now)
       cleanupExport(wings)
       log("mine done")
+      const names = [...wings.keys()].join(", ")
+      toast("success", "MemPalace", `mined ${wingCount(wings)} session(s) → ${names}`)
       return
     }
     const [wing, files] = entries[i]
@@ -411,7 +433,12 @@ function doDbSync(): void {
     execFile(bin, mineArgs(join(OUT_DIR, wing), wing), {
       encoding: "utf-8",
     }, (err) => {
-      if (err) { miningLock = false; errLog(`mine err (${wing}): ${err.message}`); return }
+      if (err) {
+        miningLock = false
+        errLog(`mine err (${wing}): ${err.message}`)
+        toast("error", "MemPalace", `mine failed (${wing}): ${err.message.slice(0, 120)}`)
+        return
+      }
       log(`mined wing ${wing} (${files.length} sessions)`)
       mineNext(i + 1)
     })
@@ -449,7 +476,8 @@ function exitSync(): void {
   } catch (e) { errLog("exit save err: " + String(e)) }
 }
 
-export default (async () => {
+export default (async ({ client }: any) => {
+  tuiClient = client || null
   mkdirSync(OUT_DIR, { recursive: true, mode: 0o700 })
   mkdirSync(HOOK_STATE_DIR, { recursive: true })
   const autoInject = isAutoInjectEnabled()
@@ -496,6 +524,7 @@ export default (async () => {
         c.lastCheckpoint = boundary
         pendingCheckpoint = { sessionID, count: c.humanMsgs }
         hookLog(`session ${sessionID}: ${c.humanMsgs} human msgs — checkpoint armed`)
+        toast("info", "MemPalace", `checkpoint armed (~${c.humanMsgs} msgs): the model will file memories now`)
       }
       counters[sessionID] = c
       persistCounters(counters)
