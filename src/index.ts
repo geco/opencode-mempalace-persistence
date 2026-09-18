@@ -5,7 +5,6 @@ import { join, dirname } from "path"
 import { createHash } from "crypto"
 import { fileURLToPath } from "url"
 import type { Plugin } from "@opencode-ai/plugin"
-import { tool } from "@opencode-ai/plugin"
 
 const HOME = homedir()
 const MEMPALACE_BIN = join(HOME, ".local/bin/mempalace")
@@ -148,47 +147,7 @@ function countPendingSuffix(): string {
   return pending > 0 ? `, ${pending} file(s) waiting to mine` : ", queue empty"
 }
 
-// On-demand sync snapshot for the /memory-toast command: same facts as
-// the startup toast, plus live-mine detection. Fires a toast AND returns
-// the text (visible in transcript too).
-function liveMiners(): string[] {
-  const found: string[] = []
-  let dir: string[] = []
-  try {
-    dir = readdirSync(join(HOME, ".mempalace/locks"))
-  } catch { return found }
-  for (const f of dir) {
-    if (!f.endsWith(".lock")) continue
-    try {
-      const content = readFileSync(join(HOME, ".mempalace/locks", f), "utf-8")
-      const pid = parseInt((content.match(/(\d+)/) || [])[1] || "", 10)
-      if (!pid) continue
-      try {
-        process.kill(pid, 0)
-        found.push(`PID ${pid} (${f.replace("mine_palace_", "").replace(".lock", "").slice(0, 8)}…)`)
-      } catch {}
-    } catch {}
-  }
-  return found
-}
-
-function syncSnapshot(): { text: string; toastMsg: string } {
-  const st = readSyncState()
-  const pending = countPendingFiles()
-  const miners = liveMiners()
-  const agoMin = st.last_sync_ms > 0 ? Math.round((Date.now() - st.last_sync_ms) / 60000) : -1
-  const syncAge = agoMin < 0 ? "never" : agoMin === 0 ? "<1 min ago" : `${agoMin} min ago`
-  const mining = miners.length > 0 ? `mining NOW (${miners.join(", ")})` : "no mine running"
-  const text =
-    `MemPalace sync — plugin v${pluginVersion()}\n` +
-    `Last sync: ${syncAge}\n` +
-    `Backlog: ${pending} file(s) waiting\n` +
-    `Status: ${mining}`
-  const toastMsg = miners.length > 0
-    ? `mining now (${miners.length}), ${pending} file(s) waiting, last sync ${syncAge}`
-    : `idle, ${pending} file(s) waiting, last sync ${syncAge}`
-  return { text, toastMsg }
-}
+// TUI toast client (set by the factory). Fire-and-forget: headless runs
 // (`opencode run`, no TUI attached) must never break on this.
 let tuiClient: any = null
 // Throttle for routine skip notices (busy palace): at most one toast
@@ -781,18 +740,6 @@ export default (async ({ client }: any) => {
   process.once("exit", onExit)
 
   return {
-    tool: {
-      mempalace_sync: tool({
-        description: "Show live MemPalace sync state (backlog, last sync, running mines) as a TUI toast and text. Use when the user asks how mining is going.",
-        args: {},
-        async execute() {
-          const snap = syncSnapshot()
-          toast("info", "MemPalace", snap.toastMsg)
-          ilog("status", { via: "tool" })
-          return snap.text
-        },
-      }),
-    },
     "chat.message": async (input, output) => {
       const role = (output.message as any).role
       if (role !== "user") return
