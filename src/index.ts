@@ -5,6 +5,7 @@ import { join, dirname } from "path"
 import { createHash } from "crypto"
 import { fileURLToPath } from "url"
 import type { Plugin } from "@opencode-ai/plugin"
+import { tool } from "@opencode-ai/plugin"
 
 const HOME = homedir()
 const MEMPALACE_BIN = join(HOME, ".local/bin/mempalace")
@@ -147,7 +148,47 @@ function countPendingSuffix(): string {
   return pending > 0 ? `, ${pending} file(s) waiting to mine` : ", queue empty"
 }
 
-// TUI toast client (set by the factory). Fire-and-forget: headless runs
+// On-demand sync snapshot for the /memory-toast command: same facts as
+// the startup toast, plus live-mine detection. Fires a toast AND returns
+// the text (visible in transcript too).
+function liveMiners(): string[] {
+  const found: string[] = []
+  let dir: string[] = []
+  try {
+    dir = readdirSync(join(HOME, ".mempalace/locks"))
+  } catch { return found }
+  for (const f of dir) {
+    if (!f.endsWith(".lock")) continue
+    try {
+      const content = readFileSync(join(HOME, ".mempalace/locks", f), "utf-8")
+      const pid = parseInt((content.match(/(\d+)/) || [])[1] || "", 10)
+      if (!pid) continue
+      try {
+        process.kill(pid, 0)
+        found.push(`PID ${pid} (${f.replace("mine_palace_", "").replace(".lock", "").slice(0, 8)}…)`)
+      } catch {}
+    } catch {}
+  }
+  return found
+}
+
+function syncSnapshot(): { text: string; toastMsg: string } {
+  const st = readSyncState()
+  const pending = countPendingFiles()
+  const miners = liveMiners()
+  const agoMin = st.last_sync_ms > 0 ? Math.round((Date.now() - st.last_sync_ms) / 60000) : -1
+  const syncAge = agoMin < 0 ? "never" : agoMin === 0 ? "<1 min ago" : `${agoMin} min ago`
+  const mining = miners.length > 0 ? `mining NOW (${miners.join(", ")})` : "no mine running"
+  const text =
+    `MemPalace sync — plugin v${pluginVersion()}\n` +
+    `Last sync: ${syncAge}\n` +
+    `Backlog: ${pending} file(s) waiting\n` +
+    `Status: ${mining}`
+  const toastMsg = miners.length > 0
+    ? `mining now (${miners.length}), ${pending} file(s) waiting, last sync ${syncAge}`
+    : `idle, ${pending} file(s) waiting, last sync ${syncAge}`
+  return { text, toastMsg }
+}
 // (`opencode run`, no TUI attached) must never break on this.
 let tuiClient: any = null
 // Throttle for routine skip notices (busy palace): at most one toast
@@ -448,11 +489,24 @@ for (mid, mts, mdata_raw) in rows:
     # is created when a reply STARTS, parts stream in afterwards, and
     # finish is set only on completion. Exporting mid-reply would
     # snapshot partial parts while the cursor advances past the message
-    # timestamp — losing the rest of the reply forever. So assistant
-    # messages without finish are skipped and revisited next sync.
+    # timestamp — losing the rest of the reply forever. So unfinished
+    # replies are skipped and revisited next sync — BUT only while
+    # recently active. A reply with no new parts for a while is dead
+    # (killed session, crashed run): treating it as perpetually
+    # in-flight would pin the cursor forever (seen live: a stillborn
+    # message froze sync for 7h). Dead replies are exported as-is.
+    now_ms = int(__import__("time").time() * 1000)
+    STALE_PART_MS = 30 * 60 * 1000
+    STALE_EMPTY_MS = 10 * 60 * 1000
     if role == "assistant" and not mdata.get("finish"):
-        incomplete.append(mts)
-        continue
+        max_part = db.execute("SELECT MAX(time_created) FROM part WHERE message_id = ?", (mid,)).fetchone()[0]
+        if max_part is None:
+            alive = (now_ms - mts) < STALE_EMPTY_MS
+        else:
+            alive = (now_ms - max_part) < STALE_PART_MS
+        if alive:
+            incomplete.append(mts)
+            continue
     for (pdata_raw,) in db.execute("SELECT data FROM part WHERE message_id = ? ORDER BY time_created", (mid,)).fetchall():
         try:
             pdata = json.loads(pdata_raw)
@@ -727,6 +781,18 @@ export default (async ({ client }: any) => {
   process.once("exit", onExit)
 
   return {
+    tool: {
+      mempalace_sync: tool({
+        description: "Show live MemPalace sync state (backlog, last sync, running mines) as a TUI toast and text. Use when the user asks how mining is going.",
+        args: {},
+        async execute() {
+          const snap = syncSnapshot()
+          toast("info", "MemPalace", snap.toastMsg)
+          ilog("status", { via: "tool" })
+          return snap.text
+        },
+      }),
+    },
     "chat.message": async (input, output) => {
       const role = (output.message as any).role
       if (role !== "user") return
