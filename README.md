@@ -308,6 +308,28 @@ When set, the plugin writes a debug log to `/tmp/opencode-mempalace.log`.
 
 ---
 
+## Observability: toasts and commands
+
+Background memory activity is visible three ways — ephemeral first,
+history on demand, never polluting session context:
+
+- **TUI toasts** (on by default, `"toasts": false` to disable): mine
+  results and errors, armed checkpoints, and every MemPalace call
+  (plugin searches and model MCP calls) with what was asked plus a
+  short answer preview. A startup toast shows the loaded build
+  (`opencode-mempalace-persistence v2.x loaded`), so npm-cache vs
+  local build is never a mystery.
+- **`/memory-status`** — palace health in the transcript: drawers,
+  KG stats, last sync, pending backlog, recent activity, errors with
+  explanations, active config. Read-only.
+- **`/memory-log [N] [filter]`** — the interaction history: every
+  search (query → result count), tool call (asked → answered preview),
+  mine (outcome per wing) and checkpoint, newest last. Backed by
+  `~/.mempalace/hook_state/interactions.log` (JSON lines, auto-rotated).
+  Read-only.
+
+---
+
 ## License
 
 MIT

@@ -1,5 +1,5 @@
 import { execSync, execFileSync, execFile, spawnSync } from "child_process"
-import { existsSync, readFileSync, writeFileSync, mkdirSync, rmdirSync, unlinkSync, appendFileSync } from "fs"
+import { existsSync, readFileSync, writeFileSync, mkdirSync, rmdirSync, unlinkSync, appendFileSync, statSync } from "fs"
 import { homedir } from "os"
 import { join, dirname } from "path"
 import { createHash } from "crypto"
@@ -15,6 +15,9 @@ const IDENTITY_FILE = join(HOME, ".mempalace/identity.txt")
 const HOOK_STATE_DIR = join(HOME, ".mempalace/hook_state")
 const COUNTERS_FILE = join(HOOK_STATE_DIR, "opencode_counters.json")
 const HOOK_LOG = join(HOOK_STATE_DIR, "hook.log")
+const INTERACTIONS_LOG = join(HOOK_STATE_DIR, "interactions.log")
+// Cap the interactions log so it never grows unbounded (approx lines).
+const INTERACTIONS_MAX_LINES = 2000
 // Private sync workspace (0700): transcripts contain conversation text,
 // so they must never sit world-readable in /tmp (see PR #1524 review).
 const SYNC_DIR = join(HOME, ".mempalace/oc-sessions")
@@ -46,6 +49,25 @@ function hookLog(msg: string) {
 function errLog(msg: string) {
   log("ERROR: " + msg)
   hookLog("ERROR: " + msg)
+}
+
+// Structured interaction log (JSON lines): every MemPalace question and
+// answer, readable by /memory-log. Ephemeral TUI toasts show the moment;
+// this file keeps the history — without polluting session context.
+function ilog(kind: string, data: Record<string, unknown>): void {
+  try {
+    mkdirSync(HOOK_STATE_DIR, { recursive: true })
+    appendFileSync(INTERACTIONS_LOG, JSON.stringify({ ts: new Date().toISOString(), kind, ...data }) + "\n")
+    // Cheap rotation: count lines only when the file looks big.
+    let size = 0
+    try { size = statSync(INTERACTIONS_LOG).size } catch {}
+    if (size > 600 * 1024) {
+      const lines = readFileSync(INTERACTIONS_LOG, "utf-8").split("\n")
+      if (lines.length > INTERACTIONS_MAX_LINES) {
+        writeFileSync(INTERACTIONS_LOG, lines.slice(-INTERACTIONS_MAX_LINES).join("\n"))
+      }
+    }
+  } catch {}
 }
 
 function toastsEnabled(): boolean {
@@ -251,6 +273,7 @@ function readIdentity(): string {
 function mempalaceSearch(query: string): string {
   const bin = resolveBin()
   if (!bin) return ""
+  const started = Date.now()
   try {
     // argv array, no shell (see PR #2): the query is raw user message
     // text, so it must never pass through /bin/sh. No manual escaping needed.
@@ -260,10 +283,12 @@ function mempalaceSearch(query: string): string {
     }).trim()
     if (!out || out.includes("No results")) {
       toast("info", "MemPalace", `search "${query.slice(0, 50)}" → no results`)
+      ilog("search", { via: "cli", query: query.slice(0, 200), results: 0, ms: Date.now() - started })
       return ""
     }
     const n = (out.match(/\n\s*\[\d+\]/g) || []).length || 1
     toast("info", "MemPalace", `search "${query.slice(0, 50)}" → ${n} result(s)`)
+    ilog("search", { via: "cli", query: query.slice(0, 200), results: n, ms: Date.now() - started })
     return out.slice(0, MAX_INJECT_CHARS)
   } catch {
     return ""
@@ -477,6 +502,7 @@ function doDbSync(): void {
       log("mine done")
       const names = [...wings.keys()].join(", ")
       toast("success", "MemPalace", `mined ${wingCount(wings)} session(s) → ${names}`)
+      ilog("mine", { outcome: "ok", sessions: wingCount(wings), wings: [...wings.keys()] })
       return
     }
     const [wing, files] = entries[i]
@@ -510,10 +536,12 @@ function doDbSync(): void {
         miningLock = false
         if (/is held by/i.test(msg)) {
           log(`mine skipped, palace busy (${wing}) after ${attempt} retries — next trigger will retry`)
+          ilog("mine", { outcome: "busy", wing })
           return
         }
         errLog(`mine err (${wing}): ${msg}`)
         toast("error", "MemPalace", `mine failed (${wing}): ${msg.slice(0, 120)}`)
+        ilog("mine", { outcome: "error", wing, error: msg.slice(0, 200) })
         return
       }
       log(`mined wing ${wing} (${files.length} sessions)`)
@@ -608,6 +636,7 @@ export default (async ({ client }: any) => {
         c.lastCheckpoint = boundary
         pendingCheckpoint = { sessionID, count: c.humanMsgs }
         hookLog(`session ${sessionID}: ${c.humanMsgs} human msgs — checkpoint armed`)
+        ilog("checkpoint", { sessionID, count: c.humanMsgs })
         toast("info", "MemPalace", `checkpoint armed (~${c.humanMsgs} msgs): the model will file memories now`)
       }
       counters[sessionID] = c
@@ -697,6 +726,11 @@ export default (async ({ client }: any) => {
         const summary = summarizeToolCall(name, (input as any)?.args, (output as any)?.output || "")
         log(`tool: ${summary}`)
         toast("info", "MemPalace", summary)
+        ilog("tool", {
+          tool: String(name).replace(/^mcp_+/, "").replace(/^mempalace_mempalace_/, "").replace(/^mempalace_/, ""),
+          asked: (() => { try { return JSON.stringify((input as any)?.args || {}).replace(/\s+/g, " ").slice(0, 200) } catch { return "" } })(),
+          answered: String((output as any)?.output || "").replace(/\s+/g, " ").slice(0, 300),
+        })
       } catch {}
     },
 
