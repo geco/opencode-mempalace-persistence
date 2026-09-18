@@ -65,32 +65,29 @@ mempalace mcp
 
 The `mempalace mcp` command gives you the exact MCP setup string for your configuration.
 
-### 4. Memory injection
+### 4. Plugin config (all optional)
 
-The plugin automatically injects your identity + relevant memories from MemPalace into every prompt. No model discipline required.
-
-Create `~/.mempalace/plugin-config.json`:
-
-```json
-{
-  "autoInjectContext": true
-}
-```
-
-Optional tuning:
+No config file is needed to start: every setting has a default, and **not
+creating anything means all defaults**. When you want to change one,
+create `~/.mempalace/plugin-config.json`:
 
 ```json
 {
-  "autoInjectContext": true,
-  "saveInterval": 15
+  "autoInjectContext": false,
+  "saveInterval": 15,
+  "toasts": true
 }
 ```
 
-- `saveInterval` (default `15`, min `5`): human messages between AI checkpoints — same cadence as the official MemPalace save hook.
+| Key | Default | What it does |
+|---|---|---|
+| `autoInjectContext` | `false` | Inject identity + `mempalace search` results into every prompt. Needs no model discipline, but adds context (and noise) to every turn. Off by default: recall happens via the skill instead |
+| `saveInterval` | `15` (min `5`) | Human messages between AI checkpoints — same cadence as the official MemPalace save hook |
+| `toasts` | `true` | TUI toasts for mines, checkpoints and MemPalace calls. Set `false` to silence them |
 
 **Do NOT put this in `opencode.json`** — OpenCode's schema validation rejects unknown keys. The plugin reads its config from `~/.mempalace/plugin-config.json` instead.
 
-When enabled:
+When `autoInjectContext` is enabled:
 - **First message**: Injects your identity from `~/.mempalace/identity.txt`
 - **Every message**: Runs `mempalace search` and injects relevant results
 
@@ -101,12 +98,14 @@ Create `~/.config/opencode/AGENTS.md`:
 ```markdown
 # Memory & Knowledge instructions
 
-## Recall (usually already covered)
+## Recall (via skill, unless auto-inject is on)
 
-The plugin auto-injects identity + relevant memories into every prompt.
-Only search MemPalace yourself (`mempalace_mempalace_search`) when the
-question is about past work, decisions, people, or projects AND the
-injected context has nothing — quote results verbatim, never paraphrase.
+Recall follows the bundled `mempalace-recall` skill (question-driven
+search). If you enabled `autoInjectContext`, identity + relevant memories
+are additionally injected into every prompt — then only search MemPalace
+yourself when the question is about past work, decisions, people, or
+projects AND the injected context has nothing. Either way, quote results
+verbatim, never paraphrase.
 
 ## Record facts (after responding, only when something new emerged)
 
@@ -269,7 +268,7 @@ The plugin exports everything in the opencode database on the next sync, then re
 |---|---|
 | `~/.config/opencode/opencode.json` | OpenCode config with plugin + MCP |
 | `~/.config/opencode/AGENTS.md` | Tells the model to manage KG facts |
-| `~/.mempalace/plugin-config.json` | Plugin config (`autoInjectContext`, `saveInterval`) |
+| `~/.mempalace/plugin-config.json` | Plugin config (`autoInjectContext`, `saveInterval`, `toasts` — all optional, see §4) |
 | `~/.config/opencode/skills/mempalace-recall/SKILL.md` | Bundled recall skill (copy from `skills/` in this repo) |
 | `~/.mempalace/identity.txt` | Your identity (injected by plugin) |
 | `~/.mempalace/hook_state/opencode_counters.json` | Per-session message counters (checkpoint cadence) |
