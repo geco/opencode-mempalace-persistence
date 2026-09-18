@@ -181,6 +181,10 @@ Session goes idle / process exits
   → Background mine of everything new since last sync
   → TUI toast confirms what was mined (disable with `"toasts": false`)
 
+Every MemPalace call — plugin searches, model MCP calls (search, diary,
+KG) — also raises a short TUI toast with what was asked and a result
+preview, so background memory activity is always visible.
+
 Compaction starts
   → [MemPalace Pre-Compact Emergency Save]: model files everything first
   → Identity + wake-up context re-attached so the summary cannot lose them

@@ -230,11 +230,33 @@ function mempalaceSearch(query: string): string {
       encoding: "utf-8",
       timeout: 15000,
     }).trim()
-    if (!out || out.includes("No results")) return ""
+    if (!out || out.includes("No results")) {
+      toast("info", "MemPalace", `search "${query.slice(0, 50)}" → no results`)
+      return ""
+    }
+    const n = (out.match(/\n\s*\[\d+\]/g) || []).length || 1
+    toast("info", "MemPalace", `search "${query.slice(0, 50)}" → ${n} result(s)`)
     return out.slice(0, MAX_INJECT_CHARS)
   } catch {
     return ""
   }
+}
+
+// TUI visibility for model-driven MCP calls (skill recall, diary, KG):
+// the plugin can't see inside the agent, but it sees every tool result.
+function isMemPalaceTool(name: string): boolean {
+  return typeof name === "string" && name.toLowerCase().includes("mempalace")
+}
+
+function summarizeToolCall(tool: string, args: any, out: string): string {
+  const short = tool.replace(/^mcp_+/, "").replace(/^mempalace_mempalace_/, "").replace(/^mempalace_/, "")
+  let asked = ""
+  try {
+    const a = typeof args === "string" ? args : JSON.stringify(args || {})
+    asked = a.replace(/\s+/g, " ").slice(0, 60)
+  } catch { asked = "" }
+  const answered = (out || "").replace(/\s+/g, " ").slice(0, 80) || "(empty)"
+  return `${short} · asked: ${asked} → ${answered}`.slice(0, 220)
 }
 
 function getLastSync(): number {
@@ -604,6 +626,16 @@ export default (async ({ client }: any) => {
       if (rescue.length > 0) {
         output.context.push(`[MemPalace Rescue — core memory, must survive compaction]\n${rescue.join("\n\n")}`)
       }
+    },
+
+    "tool.execute.after": async (input, output) => {
+      try {
+        const name = (input as any)?.tool || ""
+        if (!isMemPalaceTool(name)) return
+        const summary = summarizeToolCall(name, (input as any)?.args, (output as any)?.output || "")
+        log(`tool: ${summary}`)
+        toast("info", "MemPalace", summary)
+      } catch {}
     },
 
     event: async ({ event }: any) => {
