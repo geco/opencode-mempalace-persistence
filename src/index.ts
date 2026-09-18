@@ -14,8 +14,11 @@ const IDENTITY_FILE = join(HOME, ".mempalace/identity.txt")
 const HOOK_STATE_DIR = join(HOME, ".mempalace/hook_state")
 const COUNTERS_FILE = join(HOOK_STATE_DIR, "opencode_counters.json")
 const HOOK_LOG = join(HOOK_STATE_DIR, "hook.log")
-const OUT_DIR = "/tmp/oc-sessions"
-const TMP_SCRIPT = "/tmp/oc-plugin-query.py"
+// Private sync workspace (0700): transcripts contain conversation text,
+// so they must never sit world-readable in /tmp (see PR #1524 review).
+const SYNC_DIR = join(HOME, ".mempalace/oc-sessions")
+const OUT_DIR = SYNC_DIR
+const TMP_SCRIPT = join(SYNC_DIR, "oc-plugin-query.py")
 const DEBUG = !!process.env.OPENCODE_MEMPALACE_DEBUG
 const LOG_FILE = "/tmp/opencode-mempalace.log"
 const MAX_INJECT_CHARS = 900
@@ -85,13 +88,41 @@ let pendingCheckpoint: { sessionID: string; count: number } | null = null
 function runPython(code: string): string {
   const python = resolvePython()
   if (!python) throw new Error("no working Python interpreter (see hook.log)")
-  writeFileSync(TMP_SCRIPT, code)
+  mkdirSync(SYNC_DIR, { recursive: true, mode: 0o700 })
+  writeFileSync(TMP_SCRIPT, code, { mode: 0o600 })
   try {
     // argv array, no shell (see PR #2): paths here are fixed, never user input.
     return execFileSync(python, [TMP_SCRIPT], { encoding: "utf-8", timeout: 30000 }).trim()
   } finally {
     try { unlinkSync(TMP_SCRIPT) } catch {}
   }
+}
+
+// Resolve the mempalace CLI without hardcoding one installer layout:
+// explicit env override, PATH lookup (cross-platform, incl. Windows),
+// legacy ~/.local/bin fallback.
+let resolvedBin: string | null | undefined = undefined
+function resolveBin(): string | null {
+  if (resolvedBin !== undefined) return resolvedBin
+  const envBin = process.env.MEMPALACE_BIN
+  if (envBin && existsSync(envBin)) {
+    resolvedBin = envBin
+  } else {
+    try {
+      const found = execSync(process.platform === "win32" ? "where mempalace" : "command -v mempalace", {
+        encoding: "utf-8", timeout: 10000,
+      }).trim().split(/\r?\n/)[0]?.trim()
+      if (found) resolvedBin = found;
+    } catch {}
+    if (!resolvedBin && existsSync(MEMPALACE_BIN)) resolvedBin = MEMPALACE_BIN;
+    if (!resolvedBin) resolvedBin = null;
+  }
+  if (resolvedBin) {
+    log("using mempalace: " + resolvedBin)
+  } else {
+    errLog("mempalace CLI not found (tried MEMPALACE_BIN env, PATH, ~/.local/bin) — search/wake-up/mine disabled")
+  }
+  return resolvedBin
 }
 
 function hasText(parts: any[]): string {
@@ -137,9 +168,11 @@ function persistCounters(counters: Record<string, SessionCounter>): void {
 }
 
 function mempalaceWakeup(): string {
+  const bin = resolveBin()
+  if (!bin) return ""
   try {
     // argv array, no shell.
-    const out = execFileSync(MEMPALACE_BIN, ["wake-up"], { encoding: "utf-8", timeout: 15000 }).trim()
+    const out = execFileSync(bin, ["wake-up"], { encoding: "utf-8", timeout: 15000 }).trim()
     if (!out) return ""
     return out.slice(0, MAX_WAKEUP_CHARS)
   } catch {
@@ -168,10 +201,12 @@ function readIdentity(): string {
 }
 
 function mempalaceSearch(query: string): string {
+  const bin = resolveBin()
+  if (!bin) return ""
   try {
     // argv array, no shell (see PR #2): the query is raw user message
     // text, so it must never pass through /bin/sh. No manual escaping needed.
-    const out = execFileSync(MEMPALACE_BIN, ["search", query, "--results", String(MAX_SEARCH_RESULTS)], {
+    const out = execFileSync(bin, ["search", query, "--results", String(MAX_SEARCH_RESULTS)], {
       encoding: "utf-8",
       timeout: 15000,
     }).trim()
@@ -221,8 +256,11 @@ print(json.dumps(rows))
   if (!sessionsArr || sessionsArr.length === 0) return { wings: new Map(), now: Date.now() }
 
   const now = Date.now()
+  // Never advance the cursor past an in-flight reply: anything skipped
+  // as incomplete is revisited by the next sync (idle/exit/startup).
+  let cursor = now
   const wings = new Map<string, string[]>()
-  mkdirSync(OUT_DIR, { recursive: true })
+  mkdirSync(OUT_DIR, { recursive: true, mode: 0o700 })
 
   for (const sess of sessionsArr) {
     const [sessId, title, , directory] = sess
@@ -240,10 +278,20 @@ rows = db.execute("""
   ORDER BY m.time_created
 """).fetchall()
 texts = []
+incomplete = []
 for (mid, mts, mdata_raw) in rows:
     try: mdata = json.loads(mdata_raw)
     except: mdata = {}
     role = mdata.get("role", "unknown")
+    # Completion tracking (see PR #1524 review): the assistant message row
+    # is created when a reply STARTS, parts stream in afterwards, and
+    # finish is set only on completion. Exporting mid-reply would
+    # snapshot partial parts while the cursor advances past the message
+    # timestamp — losing the rest of the reply forever. So assistant
+    # messages without finish are skipped and revisited next sync.
+    if role == "assistant" and not mdata.get("finish"):
+        incomplete.append(mts)
+        continue
     for (pdata_raw,) in db.execute("SELECT data FROM part WHERE message_id = ? ORDER BY time_created", (mid,)).fetchall():
         try:
             pdata = json.loads(pdata_raw)
@@ -251,12 +299,20 @@ for (mid, mts, mdata_raw) in rows:
                 texts.append({"role": role, "text": pdata.get("text").strip(), "ts": mts})
         except: pass
 db.close()
-print(json.dumps(texts))
+print(json.dumps({"texts": texts, "incomplete": incomplete}))
 `)
 
     let msgList: Array<{ role: string; text: string; ts: number }>
-    try { msgList = JSON.parse(msgs) } catch { continue }
-    if (msgList.length < 2) continue
+    let incompleteTs: number[] = []
+    try {
+      const parsed = JSON.parse(msgs) as { texts: typeof msgList; incomplete: number[] }
+      msgList = parsed.texts
+      incompleteTs = parsed.incomplete || []
+    } catch { continue }
+    if (incompleteTs.length > 0) {
+      cursor = Math.min(cursor, Math.min(...incompleteTs) - 1)
+    }
+    if (msgList.length < 2 && incompleteTs.length === 0) continue
 
     const lines: string[] = [
       `# ${title || label}`,
@@ -277,14 +333,14 @@ print(json.dumps(texts))
 
     const contentHash = createHash("sha256").update(content).digest("hex").slice(0, 12)
     const wingDir = join(OUT_DIR, wing)
-    mkdirSync(wingDir, { recursive: true })
+    mkdirSync(wingDir, { recursive: true, mode: 0o700 })
     const fname = `sync_${prefix}_${contentHash}.txt`
-    writeFileSync(join(wingDir, fname), content + "\n")
+    writeFileSync(join(wingDir, fname), content + "\n", { mode: 0o600 })
     if (!wings.has(wing)) wings.set(wing, [])
     wings.get(wing)!.push(join(wingDir, fname))
   }
 
-  return { wings, now }
+  return { wings, now: cursor }
 }
 
 function markSynced(now: number): void {
@@ -292,13 +348,15 @@ function markSynced(now: number): void {
   lastSyncTs = Date.now()
 }
 
-// Official classification: decisions, preferences, milestones, problems,
-// emotional context. Agent tag keeps opencode-mined drawers attributable.
+// Default `exchange` extraction: one drawer per exchange pair, verbatim,
+// no paraphrasing (see PR #1524 review). Intelligent filing (decisions,
+// KG facts, diary) happens through AI checkpoints, not the miner.
+// Agent tag keeps opencode-mined drawers attributable.
 // One wing per project (official multi-project pattern).
 // Argv array, no shell (see PR #2): wing names are sanitized, but the
 // spawn path stays shell-free regardless.
 function mineArgs(wingDir: string, wing: string): string[] {
-  return ["mine", wingDir, "--mode", "convos", "--extract", "general", "--agent", "opencode", "--wing", wing]
+  return ["mine", wingDir, "--mode", "convos", "--agent", "opencode", "--wing", wing]
 }
 
 function cleanupExport(wings: Map<string, string[]>): void {
@@ -348,7 +406,9 @@ function doDbSync(): void {
     // wrapper shell and orphan the python mine process, which keeps
     // holding the palace lock while the next mine piles up. miningLock
     // already serializes concurrent mines; long mines run to completion.
-    execFile(MEMPALACE_BIN, mineArgs(join(OUT_DIR, wing), wing), {
+    const bin = resolveBin()
+    if (!bin) { miningLock = false; errLog("mine skipped: mempalace CLI not found"); return }
+    execFile(bin, mineArgs(join(OUT_DIR, wing), wing), {
       encoding: "utf-8",
     }, (err) => {
       if (err) { miningLock = false; errLog(`mine err (${wing}): ${err.message}`); return }
@@ -360,16 +420,26 @@ function doDbSync(): void {
 }
 
 // Best-effort synchronous save for process exit (SIGINT/SIGTERM/exit):
-// only synchronous calls are allowed here.
+// only synchronous calls are allowed here. Bounded by EXIT_BUDGET_MS so
+// shutdown stays fast; miningLock is deliberately ignored here because
+// any in-flight async mine dies with the process — at exit this sync
+// mine takes ownership (see PR #1524 review).
+const EXIT_BUDGET_MS = 45000
+const EXIT_WING_TIMEOUT_MS = 30000
 function exitSync(): void {
   try {
+    const bin = resolveBin()
+    if (!bin) return
     const { wings, now } = exportNewSessions(getLastSync())
     if (wings.size === 0) return
+    const deadline = Date.now() + EXIT_BUDGET_MS
     for (const [wing] of wings) {
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) { log("exit save: budget exhausted, rest covered next startup"); break }
       log(`exit save: mining wing ${wing}`)
-      const res = spawnSync(MEMPALACE_BIN, mineArgs(join(OUT_DIR, wing), wing), {
+      const res = spawnSync(bin, mineArgs(join(OUT_DIR, wing), wing), {
         encoding: "utf-8",
-        timeout: 60000,
+        timeout: Math.min(EXIT_WING_TIMEOUT_MS, remaining),
       })
       if (res.error || res.status !== 0) { errLog(`exit mine err (${wing}): ${String(res.error || res.status)}`); return }
     }
@@ -380,12 +450,16 @@ function exitSync(): void {
 }
 
 export default (async () => {
-  mkdirSync(OUT_DIR, { recursive: true })
+  mkdirSync(OUT_DIR, { recursive: true, mode: 0o700 })
   mkdirSync(HOOK_STATE_DIR, { recursive: true })
   const autoInject = isAutoInjectEnabled()
   const identity = readIdentity()
   const interval = saveInterval()
   log(`loaded (autoInjectContext: ${autoInject}, saveInterval: ${interval})`)
+
+  // Catch anything missed by a previous run (e.g. content skipped when
+  // the exit budget ran out). Fires once per server lifetime.
+  setTimeout(() => dbSync(), 10000)
 
   // Crash safety: best-effort synchronous save on hard exit.
   // Mirrors the official emergency-save intent (nothing async allowed here).
@@ -410,6 +484,10 @@ export default (async () => {
       // Official Save-hook cadence: count human messages per session,
       // persist like ~/.mempalace/hook_state/, arm ONE AI checkpoint
       // per boundary. The model decides WHAT to file.
+      // NOTE: no mine here by design (see PR #1524 review) — mining a
+      // mid-reply snapshot would export partial assistant parts. Mines
+      // run on idle/exit/startup, when turns are complete; the export
+      // additionally skips unfinished replies (finish tracking).
       const counters = loadCounters()
       const c = counters[sessionID] || { humanMsgs: 0, lastCheckpoint: 0 }
       c.humanMsgs += 1
@@ -418,8 +496,6 @@ export default (async () => {
         c.lastCheckpoint = boundary
         pendingCheckpoint = { sessionID, count: c.humanMsgs }
         hookLog(`session ${sessionID}: ${c.humanMsgs} human msgs — checkpoint armed`)
-        log("threshold crossed - queue sync")
-        setTimeout(() => dbSync(), 500)
       }
       counters[sessionID] = c
       persistCounters(counters)

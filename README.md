@@ -174,8 +174,7 @@ You ask a question
   → Model files topics/decisions/quotes via MCP tools, then answers
 
 The model responds
-  → Plugin detects the response is complete
-  → Saves the conversation to MemPalace (flat export, no hardcoded wings)
+  → Once the turn completes, the next idle/exit/startup mines it to MemPalace (flat export, no hardcoded wings)
   → Model records new KG facts via MCP tools (only when something new emerged)
 
 Session goes idle / process exits
@@ -194,7 +193,7 @@ Next time you ask
 
 ## What gets saved
 
-Every turn (question + answer) is saved as a drawer in MemPalace. No forced categorization — mining runs with `--mode convos --extract general`, so MemPalace itself classifies content into decisions, preferences, milestones, problems, and emotional context. Exports are grouped one wing per project (official multi-project pattern: `bot-oc` sessions land in wing `bot-oc`, never leaking across projects). The model additionally records KG facts (decisions, milestones, preferences) during conversation and at each checkpoint via MCP tools.
+Every turn (question + answer) is saved as a drawer in MemPalace. Mining runs with `--mode convos` (default `exchange` extraction: one drawer per exchange pair, verbatim, no paraphrasing). Exports are grouped one wing per project (official multi-project pattern: `bot-oc` sessions land in wing `bot-oc`, never leaking across projects). Only completed turns are exported (in-flight replies are revisited by the next sync). The model additionally records KG facts (decisions, milestones, preferences) during conversation and at each checkpoint via MCP tools.
 
 ### Backfill existing sessions
 
@@ -222,18 +221,16 @@ The plugin exports everything in the opencode database on the next sync, then re
                  │    ↓                          │
                  │  Model sees context → answers │
                  │    ↓                          │
-  Answer done ──►│  chat.message (count) + session.idle    │
-                  │  Every N msgs / idle / exit:              │
-                  │    ↓                          │
-                  │  Query OpenCode DB            │
-                  │  since last sync              │
-                  │    ↓                          │
-                  │  Export → flat text files     │
-                  │    ↓                          │
-                  │  mempalace mine --mode convos │
-                  │  --extract general (async)    │
-                  │  single serialized call       │
-                  └──────────────────────────────┘
+  Answer done ──►│  chat.message (count) + session.idle   │
+                 │  mine on idle / exit / startup           │
+                 │    ↓                                     │
+                 │  Query OpenCode DB (completed turns)     │
+                 │    ↓                                     │
+                 │  Export → flat text files (0700)         │
+                 │    ↓                                     │
+                 │  mempalace mine --mode convos            │
+                 │  single serialized call                  │
+                 └──────────────────────────────────────────┘
                             │
                             ▼
                  ┌──────────────────────────┐
@@ -262,7 +259,8 @@ The plugin exports everything in the opencode database on the next sync, then re
 | `~/.config/opencode/skills/mempalace-recall/SKILL.md` | Bundled recall skill (copy from `skills/` in this repo) |
 | `~/.mempalace/identity.txt` | Your identity (injected by plugin) |
 | `~/.mempalace/hook_state/opencode_counters.json` | Per-session message counters (checkpoint cadence) |
-| `~/.mempalace/hook_state/hook.log` | Checkpoint / pre-compact event log |
+| `~/.mempalace/hook_state/hook.log` | Checkpoint / pre-compact event log (errors always land here) |
+| `~/.mempalace/oc-sessions/` | Private (0700) export workspace for pending transcripts |
 | `~/.mempalace/config.json` | MemPalace config (palace path) |
 | `~/.mempalace/knowledge_graph.sqlite3` | Knowledge Graph (structured facts) |
 | `~/opencode-memory/` | MemPalace vector DB (all drawers) |
