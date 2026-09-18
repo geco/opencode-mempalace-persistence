@@ -79,20 +79,34 @@ function toastsEnabled(): boolean {
   return true
 }
 
-// Messages arrived after the sync cursor: still waiting for the next run.
-function countPendingMessages(sinceMs: number): number {
+// Messages arrived after each wing's sync cursor: still waiting for the
+// next run. Per-wing, so one slow wing never masks the others.
+function countPendingMessages(): { total: number; byWing: Record<string, number> } {
   try {
+    const st = readSyncState()
     const out = runPython(`
-import sqlite3
+import sqlite3, json, re
 db = sqlite3.connect(${JSON.stringify(OPENCODE_DB)})
-n = db.execute("SELECT COUNT(*) FROM message WHERE time_created > ${sinceMs}").fetchone()[0]
+cursors = json.loads(${JSON.stringify(JSON.stringify(st.wings || {}))})
+default = ${st.last_sync_ms || 0}
+rows = db.execute("""
+  SELECT s.directory, m.time_created FROM message m
+  INNER JOIN session s ON s.id = m.session_id
+""").fetchall()
 db.close()
-print(n)
+by = {}
+for (directory, mts) in rows:
+    base = ((directory or "").rstrip("/").split("/") or ["global"])[-1] or "global"
+    wing = re.sub("[^a-zA-Z0-9_-]", "_", base)[:40] or "global"
+    if mts > cursors.get(wing, default):
+        by[wing] = by.get(wing, 0) + 1
+print(json.dumps(by))
 `)
-    const n = parseInt(out.trim(), 10)
-    return isNaN(n) ? 0 : n
+    const byWing = JSON.parse(out) as Record<string, number>
+    const total = Object.values(byWing).reduce((a, b) => a + b, 0)
+    return { total, byWing }
   } catch {
-    return 0
+    return { total: 0, byWing: {} }
   }
 }
 let cachedName: string | undefined = undefined
@@ -343,9 +357,26 @@ function summarizeToolCall(tool: string, args: any, out: string): string {
   return `${short} · asked: ${asked} → ${answered}`.slice(0, 220)
 }
 
-function getLastSync(): number {
+interface SyncState { last_sync_ms: number; wings?: Record<string, number> }
+
+function readSyncState(): SyncState {
+  try {
+    const raw = JSON.parse(readFileSync(STATE_FILE, "utf-8")) as SyncState
+    if (typeof raw?.last_sync_ms === "number") {
+      return { last_sync_ms: raw.last_sync_ms, wings: raw.wings && typeof raw.wings === "object" ? raw.wings : {} }
+    }
+  } catch {}
+  return { last_sync_ms: 0, wings: {} }
+}
+
+// Per-wing cursors (see PR #1524 follow-up): a global cursor stalls
+// forever when one wing keeps failing while others succeed. Each wing
+// advances independently; last_sync_ms stays the min for compatibility.
+function getLastSync(wing?: string): number {
   if (!existsSync(STATE_FILE)) return 0
-  try { return JSON.parse(readFileSync(STATE_FILE, "utf-8")).last_sync_ms || 0 } catch { return 0 }
+  const st = readSyncState()
+  if (wing && st.wings && typeof st.wings[wing] === "number") return st.wings[wing] as number
+  return st.last_sync_ms || 0
 }
 
 function dbSync(): void {
@@ -357,11 +388,14 @@ function backfillRequested(): boolean {
   return !!process.env.OPENCODE_MEMPALACE_BACKFILL
 }
 
-// Export all sessions with new messages since `sinceMs` as flat transcripts,
-// grouped by project wing (official multi-project pattern: one wing per
-// project, so memories never leak across projects). Filenames embed a
-// content hash, so re-exports are naturally idempotent.
-function exportNewSessions(sinceMs: number): { wings: Map<string, string[]>; now: number } {
+// Export sessions with new messages as flat transcripts, grouped by
+// project wing. cursorFor(wing) gives each wing its own cursor (null =
+// discovery floor: sessions with anything newer anywhere). Filenames
+// embed a content hash, so re-exports are naturally idempotent.
+function exportNewSessions(
+  cursorFor: (wing: string | null) => number,
+): { wings: Map<string, string[]>; now: number } {
+  const sinceMs = cursorFor(null)
   const sessions = runPython(`
 import sqlite3, json
 db = sqlite3.connect(${JSON.stringify(OPENCODE_DB)})
@@ -394,13 +428,14 @@ print(json.dumps(rows))
       .replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 40) || "global"
     const label = (title || "").replace(/[^a-zA-Z0-9 _-]/g, "_") || (sessId || "").slice(0, 12)
     const prefix = `${new Date().toISOString().slice(0, 10)}_${label.slice(0, 30)}_${(sessId || "").slice(0, 8)}`
+    const wingSince = cursorFor(wing)
 
     const msgs = runPython(`
 import sqlite3, json
 db = sqlite3.connect(${JSON.stringify(OPENCODE_DB)})
 rows = db.execute("""
   SELECT m.id, m.time_created, m.data FROM message m
-  WHERE m.session_id = ${JSON.stringify(sessId)} AND m.time_created > ${sinceMs}
+  WHERE m.session_id = ${JSON.stringify(sessId)} AND m.time_created > ${wingSince}
   ORDER BY m.time_created
 """).fetchall()
 texts = []
@@ -469,8 +504,19 @@ print(json.dumps({"texts": texts, "incomplete": incomplete}))
   return { wings, now: cursor }
 }
 
-function markSynced(now: number): void {
-  writeFileSync(STATE_FILE, JSON.stringify({ last_sync_ms: now }))
+function markSynced(now: number, wing?: string): void {
+  try {
+    const st = readSyncState()
+    if (wing) {
+      st.wings = st.wings || {}
+      st.wings[wing] = now
+      const vals = Object.values(st.wings)
+      st.last_sync_ms = vals.length > 0 ? Math.min(...vals) : now
+    } else {
+      st.last_sync_ms = now
+    }
+    writeFileSync(STATE_FILE, JSON.stringify(st))
+  } catch (e) { log("state write err: " + String(e)) }
   lastSyncTs = Date.now()
 }
 
@@ -486,12 +532,14 @@ function mineArgs(wingDir: string, wing: string): string[] {
 }
 
 function cleanupExport(wings: Map<string, string[]>): void {
-  for (const files of wings.values()) {
-    for (const f of files) {
-      try { unlinkSync(f) } catch {}
-    }
-  }
+  // Wipe whole wing dirs: a successful mine filed everything in them,
+  // including orphan files from previously failed runs.
   for (const wing of wings.keys()) {
+    try {
+      for (const f of readdirSync(join(OUT_DIR, wing))) {
+        try { unlinkSync(join(OUT_DIR, wing, f)) } catch {}
+      }
+    } catch {}
     try { rmdirSync(join(OUT_DIR, wing)) } catch {}
   }
   try { rmdirSync(OUT_DIR) } catch {}
@@ -508,8 +556,11 @@ function doDbSync(): void {
 
   const sinceMs = backfillRequested() ? 0 : getLastSync()
   if (backfillRequested()) log("backfill requested: exporting full history")
+  const cursorFor = backfillRequested()
+    ? (_wing: string | null) => 0
+    : (wing: string | null) => (wing ? getLastSync(wing) : getLastSync())
 
-  const { wings, now } = exportNewSessions(sinceMs)
+  const { wings, now } = exportNewSessions(cursorFor)
   if (wings.size === 0) return
 
   miningLock = true
@@ -531,20 +582,16 @@ function doDbSync(): void {
   const mineNext = (i: number, attempt = 0): void => {
     if (i >= entries.length) {
       miningLock = false
-      // Advance state only on full success: on failure the same
-      // content-hashed files are re-exported and retried at the next
-      // sync (mine is idempotent).
-      markSynced(now)
       cleanupExport(wings)
       log("mine done")
       const names = [...wings.keys()].join(", ")
       const totalDrawers = [...wingDrawers.values()].reduce((a, b) => a + b, 0)
       const detail = totalDrawers > 0 ? ` (${totalDrawers} drawers)` : ""
       // Anything that arrived while this mine was running stays pending.
-      const remaining = countPendingMessages(now)
-      const tail = remaining > 0 ? `, ${remaining} message(s) still waiting` : ", queue empty"
+      const remaining = countPendingMessages()
+      const tail = remaining.total > 0 ? `, ${remaining.total} message(s) still waiting` : ", queue empty"
       toast("success", "MemPalace", `mined ${wingCount(wings)} session(s) → ${names}${detail}${tail}`)
-      ilog("mine", { outcome: "ok", sessions: wingCount(wings), wings: [...wings.keys()], drawers: totalDrawers, remaining })
+      ilog("mine", { outcome: "ok", sessions: wingCount(wings), wings: [...wings.keys()], drawers: totalDrawers, remaining: remaining.total })
       return
     }
     const [wing, files] = entries[i]
@@ -588,6 +635,11 @@ function doDbSync(): void {
       }
       log(`mined wing ${wing} (${files.length} sessions)`)
       wingDrawers.set(wing, parseDrawers(stdout))
+      // Per-wing cursor: this wing's progress is banked even if a later
+      // wing fails — the counter never stalls on one slow wing again.
+      markSynced(now, wing)
+      for (const f of files) { try { unlinkSync(f) } catch {} }
+      try { rmdirSync(join(OUT_DIR, wing)) } catch {}
       // Truthful progress: one toast per completed wing (an exact % is
       // impossible — the mine CLI is a black box with ~4s startup cost
       // per invocation, so per-file mines would only add overhead).
@@ -609,9 +661,10 @@ function exitSync(): void {
   try {
     const bin = resolveBin()
     if (!bin) return
-    const { wings, now } = exportNewSessions(getLastSync())
+    const { wings, now } = exportNewSessions((wing) => (wing ? getLastSync(wing) : getLastSync()))
     if (wings.size === 0) return
     const deadline = Date.now() + EXIT_BUDGET_MS
+    const done: string[] = []
     for (const [wing] of wings) {
       const remaining = deadline - Date.now()
       if (remaining <= 0) { log("exit save: budget exhausted, rest covered next startup"); break }
@@ -620,10 +673,19 @@ function exitSync(): void {
         encoding: "utf-8",
         timeout: Math.min(EXIT_WING_TIMEOUT_MS, remaining),
       })
-      if (res.error || res.status !== 0) { errLog(`exit mine err (${wing}): ${String(res.error || res.status)}`); return }
+      if (res.error || res.status !== 0) {
+        const why = (res.error as any)?.message || (res as any).signal || res.status
+        errLog(`exit mine err (${wing}): ${String(why)}`)
+        return
+      }
+      markSynced(now, wing)
+      done.push(wing)
     }
-    markSynced(now)
-    cleanupExport(wings)
+    for (const wing of done) {
+      for (const f of wings.get(wing) || []) { try { unlinkSync(f) } catch {} }
+      try { rmdirSync(join(OUT_DIR, wing)) } catch {}
+    }
+    try { rmdirSync(OUT_DIR) } catch {}
     log("exit save done")
   } catch (e) { errLog("exit save err: " + String(e)) }
 }
