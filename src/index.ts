@@ -346,15 +346,34 @@ function isMemPalaceTool(name: string): boolean {
   return typeof name === "string" && name.toLowerCase().includes("mempalace")
 }
 
-function summarizeToolCall(tool: string, args: any, out: string): string {
+// MCP tool results arrive as content blocks ({content: [{type, text}]),
+// NOT as a flat `output` string (diagnosed via shape logging 2026-09-19:
+// keys=["content"], no `output` key at all).
+function extractResultText(out: any): string {
+  try {
+    const blocks = out?.content
+    if (Array.isArray(blocks)) {
+      const text = blocks
+        .filter((b: any) => b && (b.type === "text" || typeof b.text === "string") && typeof b.text === "string")
+        .map((b: any) => String(b.text))
+        .join("\n")
+      if (text.trim()) return text;
+    }
+    if (typeof out?.output === "string" && out.output.trim()) return out.output;
+    if (typeof out === "string" && out.trim()) return out;
+  } catch {}
+  return ""
+}
+
+function summarizeToolCall(tool: string, args: any, out: any): string {
   const short = tool.replace(/^mcp_+/, "").replace(/^mempalace_mempalace_/, "").replace(/^mempalace_/, "")
   let asked = ""
   try {
     const a = typeof args === "string" ? args : JSON.stringify(args || {})
     asked = a.replace(/\s+/g, " ").slice(0, 60)
   } catch { asked = "" }
-  const answered = (out || "").replace(/\s+/g, " ").slice(0, 80) || "(empty)"
-  return `${short} · asked: ${asked} → ${answered}`.slice(0, 220)
+  const answered = extractResultText(out).replace(/\s+/g, " ").slice(0, 120) || "(empty)"
+  return `${short} · asked: ${asked} → ${answered}`.slice(0, 260)
 }
 
 interface SyncState { last_sync_ms: number; wings?: Record<string, number> }
@@ -849,7 +868,7 @@ export default (async ({ client }: any) => {
       try {
         const name = (input as any)?.tool || ""
         if (!isMemPalaceTool(name)) return
-        const summary = summarizeToolCall(name, (input as any)?.args, (output as any)?.output || "")
+        const summary = summarizeToolCall(name, (input as any)?.args, output)
         log(`tool: ${summary}`)
         toast("info", "MemPalace", summary)
         // Diagnostic: MCP results may live outside `output` — record the
@@ -858,7 +877,7 @@ export default (async ({ client }: any) => {
         ilog("tool", {
           tool: String(name).replace(/^mcp_+/, "").replace(/^mempalace_mempalace_/, "").replace(/^mempalace_/, ""),
           asked: (() => { try { return JSON.stringify((input as any)?.args || {}).replace(/\s+/g, " ").slice(0, 200) } catch { return "" } })(),
-          answered: String(outAny.output || "").replace(/\s+/g, " ").slice(0, 300),
+          answered: extractResultText(output).replace(/\s+/g, " ").slice(0, 300),
           shape: {
             keys: Object.keys(outAny),
             title: outAny.title,
