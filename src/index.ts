@@ -852,10 +852,19 @@ export default (async ({ client }: any) => {
         const summary = summarizeToolCall(name, (input as any)?.args, (output as any)?.output || "")
         log(`tool: ${summary}`)
         toast("info", "MemPalace", summary)
+        // Diagnostic: MCP results may live outside `output` — record the
+        // real shape once so extraction can be fixed (see answered-empty).
+        const outAny = (output as any) || {}
         ilog("tool", {
           tool: String(name).replace(/^mcp_+/, "").replace(/^mempalace_mempalace_/, "").replace(/^mempalace_/, ""),
           asked: (() => { try { return JSON.stringify((input as any)?.args || {}).replace(/\s+/g, " ").slice(0, 200) } catch { return "" } })(),
-          answered: String((output as any)?.output || "").replace(/\s+/g, " ").slice(0, 300),
+          answered: String(outAny.output || "").replace(/\s+/g, " ").slice(0, 300),
+          shape: {
+            keys: Object.keys(outAny),
+            title: outAny.title,
+            metaKeys: outAny.metadata && typeof outAny.metadata === "object" ? Object.keys(outAny.metadata) : typeof outAny.metadata,
+            raw: JSON.stringify(outAny).slice(0, 300),
+          },
         })
       } catch {}
     },
