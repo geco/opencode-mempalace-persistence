@@ -28,6 +28,9 @@ const LOG_FILE = "/tmp/opencode-mempalace.log"
 const MAX_INJECT_CHARS = 900
 const MAX_SEARCH_RESULTS = 3
 const MAX_WAKEUP_CHARS = 1500
+// Message-ID retention for export dedup: age + size caps (see commitExportedIds).
+const MINED_IDS_MAX_AGE_MS = 90 * 24 * 3600 * 1000
+const MINED_IDS_MAX_ENTRIES = 200000
 // Official MemPalace hook cadence: AI checkpoint every N human messages.
 const DEFAULT_SAVE_INTERVAL = 15
 
@@ -376,16 +379,55 @@ function summarizeToolCall(tool: string, args: any, out: any): string {
   return `${short} · asked: ${asked} → ${answered}`.slice(0, 260)
 }
 
-interface SyncState { last_sync_ms: number; wings?: Record<string, number> }
+interface SyncState { last_sync_ms: number; wings?: Record<string, number>; mined_ids?: Record<string, number> }
 
 function readSyncState(): SyncState {
   try {
     const raw = JSON.parse(readFileSync(STATE_FILE, "utf-8")) as SyncState
     if (typeof raw?.last_sync_ms === "number") {
-      return { last_sync_ms: raw.last_sync_ms, wings: raw.wings && typeof raw.wings === "object" ? raw.wings : {} }
+      return {
+        last_sync_ms: raw.last_sync_ms,
+        wings: raw.wings && typeof raw.wings === "object" ? raw.wings : {},
+        mined_ids: raw.mined_ids && typeof raw.mined_ids === "object" ? raw.mined_ids : {},
+      }
     }
   } catch {}
-  return { last_sync_ms: 0, wings: {} }
+  return { last_sync_ms: 0, wings: {}, mined_ids: {} }
+}
+
+// Message IDs already exported in a previous run. An ID older than every
+// cursor can never be selected again (queries use time_created > cursor),
+// so the set is pruned to stay small.
+function loadMinedIds(): Map<string, number> {
+  try {
+    const raw = (readSyncState().mined_ids || {}) as Record<string, number>
+    return new Map(Object.entries(raw).filter(([, ts]) => typeof ts === "number"))
+  } catch {
+    return new Map()
+  }
+}
+
+function commitExportedIds(byWing: Map<string, Map<string, number>>): void {
+  try {
+    const st = readSyncState()
+    const merged: Record<string, number> = { ...(st.mined_ids || {}) }
+    for (const ids of byWing.values()) {
+      for (const [mid, ts] of ids) {
+        if (typeof ts === "number") merged[mid] = ts
+      }
+    }
+    // Retention by AGE (90d) and SIZE (200k newest) — NOT by cursor.
+    // Cursors move backward on incomplete clamps and stall on failures;
+    // cursor-based pruning dropped IDs that future exports reselect,
+    // silently disabling the filter (seen live: set always empty).
+    const cutoff = Date.now() - MINED_IDS_MAX_AGE_MS
+    let entries = Object.entries(merged).filter(([, ts]) => typeof ts === "number" && (ts as number) >= cutoff)
+    if (entries.length > MINED_IDS_MAX_ENTRIES) {
+      entries = entries.sort((a, b) => (b[1] as number) - (a[1] as number)).slice(0, MINED_IDS_MAX_ENTRIES)
+    }
+    st.mined_ids = Object.fromEntries(entries)
+    writeFileSync(STATE_FILE, JSON.stringify(st))
+  } catch (e) { log("mined-ids write err: " + String(e)) }
 }
 
 // Per-wing cursors (see PR #1524 follow-up): a global cursor stalls
@@ -413,7 +455,7 @@ function backfillRequested(): boolean {
 // embed a content hash, so re-exports are naturally idempotent.
 function exportNewSessions(
   cursorFor: (wing: string | null) => number,
-): { wings: Map<string, string[]>; now: number } {
+): { wings: Map<string, string[]>; now: number; exportedIds: Map<string, Map<string, number>> } {
   const sinceMs = cursorFor(null)
   const sessions = runPython(`
 import sqlite3, json
@@ -431,14 +473,20 @@ print(json.dumps(rows))
 `)
 
   let sessionsArr: any[][]
-  try { sessionsArr = JSON.parse(sessions) } catch { return { wings: new Map(), now: Date.now() } }
-  if (!sessionsArr || sessionsArr.length === 0) return { wings: new Map(), now: Date.now() }
+  try { sessionsArr = JSON.parse(sessions) } catch { return { wings: new Map(), now: Date.now(), exportedIds: new Map() } }
+  if (!sessionsArr || sessionsArr.length === 0) return { wings: new Map(), now: Date.now(), exportedIds: new Map() }
 
   const now = Date.now()
   // Never advance the cursor past an in-flight reply: anything skipped
   // as incomplete is revisited by the next sync (idle/exit/startup).
   let cursor = now
   const wings = new Map<string, string[]>()
+  // Already-mined IDs loaded ONCE per export (state file can be MBs).
+  const seen = loadMinedIds()
+  // Message IDs written to export files, PER WING. Recorded only when
+  // that wing mines successfully — recording another wing's IDs early
+  // would skip its content forever on failure.
+  const exportedByWing = new Map<string, Map<string, number>>()
   mkdirSync(OUT_DIR, { recursive: true, mode: 0o700 })
 
   for (const sess of sessionsArr) {
@@ -489,17 +537,21 @@ for (mid, mts, mdata_raw) in rows:
         try:
             pdata = json.loads(pdata_raw)
             if pdata.get("type") == "text" and pdata.get("text","").strip():
-                texts.append({"role": role, "text": pdata.get("text").strip(), "ts": mts})
+                texts.append({"mid": mid, "role": role, "text": pdata.get("text").strip(), "ts": mts})
         except: pass
 db.close()
 print(json.dumps({"texts": texts, "incomplete": incomplete}))
 `)
 
-    let msgList: Array<{ role: string; text: string; ts: number }>
+    let msgList: Array<{ mid: string; role: string; text: string; ts: number }>
     let incompleteTs: number[] = []
     try {
       const parsed = JSON.parse(msgs) as { texts: typeof msgList; incomplete: number[] }
-      msgList = parsed.texts
+      // Message-level dedup: each message is exported exactly once ever.
+      // Repeated boilerplate (system prompts re-sent every turn) across
+      // overlapping windows was the main duplicate source mempalace's
+      // file-level dedup cannot catch (different files, same paragraph).
+      msgList = (parsed.texts || []).filter((m) => m && m.mid && !seen.has(m.mid))
       incompleteTs = parsed.incomplete || []
     } catch { continue }
     if (incompleteTs.length > 0) {
@@ -529,11 +581,16 @@ print(json.dumps({"texts": texts, "incomplete": incomplete}))
     mkdirSync(wingDir, { recursive: true, mode: 0o700 })
     const fname = `sync_${prefix}_${contentHash}.txt`
     writeFileSync(join(wingDir, fname), content + "\n", { mode: 0o600 })
+    if (!exportedByWing.has(wing)) exportedByWing.set(wing, new Map())
+    const wingIds = exportedByWing.get(wing)!
+    for (const m of msgList) {
+      if (m && m.mid && typeof m.ts === "number") wingIds.set(m.mid, m.ts)
+    }
     if (!wings.has(wing)) wings.set(wing, [])
     wings.get(wing)!.push(join(wingDir, fname))
   }
 
-  return { wings, now: cursor }
+  return { wings, now: cursor, exportedIds: exportedByWing }
 }
 
 function markSynced(now: number, wing?: string): void {
@@ -592,7 +649,7 @@ function doDbSync(): void {
     ? (_wing: string | null) => 0
     : (wing: string | null) => (wing ? getLastSync(wing) : getLastSync())
 
-  const { wings, now } = exportNewSessions(cursorFor)
+  const { wings, now, exportedIds } = exportNewSessions(cursorFor)
   if (wings.size === 0) return
 
   miningLock = true
@@ -669,7 +726,10 @@ function doDbSync(): void {
       wingDrawers.set(wing, parseDrawers(stdout))
       // Per-wing cursor: this wing's progress is banked even if a later
       // wing fails — the counter never stalls on one slow wing again.
+      // Only THIS wing's message IDs are recorded: other wings' content
+      // is not filed yet, recording it would skip it forever on failure.
       markSynced(now, wing)
+      commitExportedIds(new Map([[wing, exportedIds.get(wing) || new Map()]]))
       for (const f of files) { try { unlinkSync(f) } catch {} }
       try { rmdirSync(join(OUT_DIR, wing)) } catch {}
       // Truthful progress: one toast per completed wing (an exact % is
@@ -693,7 +753,7 @@ function exitSync(): void {
   try {
     const bin = resolveBin()
     if (!bin) return
-    const { wings, now } = exportNewSessions((wing) => (wing ? getLastSync(wing) : getLastSync()))
+    const { wings, now, exportedIds } = exportNewSessions((wing) => (wing ? getLastSync(wing) : getLastSync()))
     if (wings.size === 0) return
     const deadline = Date.now() + EXIT_BUDGET_MS
     const done: string[] = []
@@ -711,6 +771,7 @@ function exitSync(): void {
         return
       }
       markSynced(now, wing)
+      commitExportedIds(new Map([[wing, exportedIds.get(wing) || new Map()]]))
       done.push(wing)
     }
     for (const wing of done) {
