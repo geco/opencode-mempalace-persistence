@@ -219,6 +219,13 @@ OPENCODE_MEMPALACE_BACKFILL=1 opencode
 
 The plugin exports everything in the opencode database on the next sync, then resumes incremental mode. Mining is idempotent — re-running is safe.
 
+### Durability notes (drawers vs KG)
+
+- **Drawers** (transcripts) are append-mostly: a crash mid-mine can only leave already-filed content behind, never corrupt what's stored. Re-running the mine is always safe.
+- **KG facts** live a different life: `kg_supersede` replaces a fact atomically at a shared boundary (single transaction) — a mid-write crash rolls back to the *old* fact: stale but present, never half-written.
+- **Reads are validity-window only**: there is no liveness check on read, so a stale fact reads as current until the model revisits it (via checkpoint, diary review, or a new decision on the same subject).
+- **Backfill mines transcripts into drawers only** — it never touches the KG. KG facts come exclusively from live MCP calls (conversation, checkpoints, diary). A crashed supersede therefore waits for the next model touch, not the next backfill.
+
 ---
 
 ## Architecture
