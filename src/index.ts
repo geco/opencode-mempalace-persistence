@@ -31,6 +31,11 @@ const MAX_WAKEUP_CHARS = 1500
 // Message-ID retention for export dedup: age + size caps (see commitExportedIds).
 const MINED_IDS_MAX_AGE_MS = 90 * 24 * 3600 * 1000
 const MINED_IDS_MAX_ENTRIES = 200000
+// All child-process output buffers raised well above Node's 1 MiB
+// default (see issue #6): session exports and mine summaries routinely
+// exceed it (a single message.data with summary.diffs measured 1.1 MB),
+// and ENOBUFS aborted the whole sync permanently.
+const CHILD_MAX_BUFFER = 64 * 1024 * 1024
 // Official MemPalace hook cadence: AI checkpoint every N human messages.
 const DEFAULT_SAVE_INTERVAL = 15
 
@@ -210,7 +215,7 @@ function runPython(code: string): string {
   writeFileSync(TMP_SCRIPT, code, { mode: 0o600 })
   try {
     // argv array, no shell (see PR #2): paths here are fixed, never user input.
-    return execFileSync(python, [TMP_SCRIPT], { encoding: "utf-8", timeout: 30000 }).trim()
+    return execFileSync(python, [TMP_SCRIPT], { encoding: "utf-8", timeout: 30000, maxBuffer: CHILD_MAX_BUFFER }).trim()
   } finally {
     try { unlinkSync(TMP_SCRIPT) } catch {}
   }
@@ -290,7 +295,7 @@ function mempalaceWakeup(): string {
   if (!bin) return ""
   try {
     // argv array, no shell.
-    const out = execFileSync(bin, ["wake-up"], { encoding: "utf-8", timeout: 15000 }).trim()
+    const out = execFileSync(bin, ["wake-up"], { encoding: "utf-8", timeout: 15000, maxBuffer: CHILD_MAX_BUFFER }).trim()
     if (!out) return ""
     return out.slice(0, MAX_WAKEUP_CHARS)
   } catch {
@@ -328,6 +333,7 @@ function mempalaceSearch(query: string): string {
     const out = execFileSync(bin, ["search", query, "--results", String(MAX_SEARCH_RESULTS)], {
       encoding: "utf-8",
       timeout: 15000,
+      maxBuffer: CHILD_MAX_BUFFER,
     }).trim()
     if (!out || out.includes("No results")) {
       toast("info", "MemPalace", `search "${query.slice(0, 50)}" → no results`)
@@ -490,6 +496,7 @@ print(json.dumps(rows))
   mkdirSync(OUT_DIR, { recursive: true, mode: 0o700 })
 
   for (const sess of sessionsArr) {
+  try {
     const [sessId, title, , directory] = sess
     const wing = (((directory as string) || "").split("/").filter(Boolean).pop() || "global")
       .replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 40) || "global"
@@ -588,6 +595,15 @@ print(json.dumps({"texts": texts, "incomplete": incomplete}))
     }
     if (!wings.has(wing)) wings.set(wing, [])
     wings.get(wing)!.push(join(wingDir, fname))
+  } catch (e) {
+    // One pathological session (oversized payload, corrupt row) must
+    // never abort the whole export — skip it, log, continue with the
+    // rest (see issue #6).
+    try {
+      errLog(`export skipped session ${(sess as any[])?.[0] || "?"}: ${String(e).slice(0, 160)}`)
+    } catch {}
+    continue
+  }
   }
 
   return { wings, now: cursor, exportedIds: exportedByWing }
@@ -692,6 +708,7 @@ function doDbSync(): void {
     if (!bin) { miningLock = false; errLog("mine skipped: mempalace CLI not found"); return }
     execFile(bin, mineArgs(join(OUT_DIR, wing), wing), {
       encoding: "utf-8",
+      maxBuffer: CHILD_MAX_BUFFER,
     }, (err, stdout) => {
       if (err) {
         const msg = err.message || String(err)
@@ -764,6 +781,7 @@ function exitSync(): void {
       const res = spawnSync(bin, mineArgs(join(OUT_DIR, wing), wing), {
         encoding: "utf-8",
         timeout: Math.min(EXIT_WING_TIMEOUT_MS, remaining),
+        maxBuffer: CHILD_MAX_BUFFER,
       })
       if (res.error || res.status !== 0) {
         const why = (res.error as any)?.message || (res as any).signal || res.status
