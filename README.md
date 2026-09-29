@@ -38,6 +38,13 @@ The plugin injects relevant memories from MemPalace into every prompt (via `expe
 
 Add this line to your `~/.config/opencode/opencode.json` and restart OpenCode.
 
+Works on **OpenCode v1 (>= 1.18.29) and v2** — the package ships a dual
+entrypoint (`server()` for v1, `Plugin.define({ id, setup })` for v2), so the
+same install works before and after you move to v2. One caveat on v2: the
+plugin runs in the server runtime, which has no `tui.showToast`, so TUI
+toasts are silent there — `hook.log`, `interactions.log`, `/memory-status`
+and `/memory-log` are unaffected.
+
 ### 2. Identity (who you are)
 
 Create `~/.mempalace/identity.txt`:
@@ -329,7 +336,8 @@ history on demand, never polluting session context:
   (plugin searches and model MCP calls) with what was asked plus a
   short answer preview. A startup toast shows the loaded build
   (`opencode-mempalace-persistence v2.x loaded`), so npm-cache vs
-  local build is never a mystery.
+  local build is never a mystery. *(Silent on OpenCode v2 — its server
+  runtime has no toast surface; use `/memory-log` there.)*
 - **`/memory-status`** — palace health in the transcript: drawers,
   KG stats, last sync, pending backlog, recent activity, errors with
   explanations, active config. Read-only.

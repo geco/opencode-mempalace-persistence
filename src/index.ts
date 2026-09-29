@@ -5,6 +5,7 @@ import { join, dirname } from "path"
 import { createHash } from "crypto"
 import { fileURLToPath } from "url"
 import type { Plugin } from "@opencode-ai/plugin"
+import { Plugin as PluginV2 } from "@opencode/plugin"
 
 const HOME = homedir()
 const MEMPALACE_BIN = join(HOME, ".local/bin/mempalace")
@@ -203,6 +204,29 @@ function resolvePython(): string | null {
 let miningLock = false
 let lastSyncTs = 0
 let wakeupDone = false
+// V1 factory consts (autoInject/identity/interval) become shared runtime
+// state so both the V1 server() and the V2 setup() use one init.
+let runtimeInit = false
+let autoInject = false
+let identity = ""
+let interval = DEFAULT_SAVE_INTERVAL
+// Exact-once guard for the V2 prompt hook: the server may instantiate one
+// plugin per location, so the same user message could pass several hook
+// registrations in one process. messageID dedup keeps counting exact.
+const seenPromptIDs = new Set<string>()
+function rememberPromptID(id: string): boolean {
+  if (!id || seenPromptIDs.has(id)) return false
+  seenPromptIDs.add(id)
+  if (seenPromptIDs.size > 5000) {
+    const it = seenPromptIDs.values()
+    for (let i = 0; i < 1000; i++) {
+      const n = it.next()
+      if (n.done) break
+      seenPromptIDs.delete(n.value)
+    }
+  }
+  return true
+}
 // Set by chat.message when a SAVE_INTERVAL boundary is crossed,
 // consumed once by the next messages.transform (same pattern as the
 // official Stop hook: the hook decides WHEN, the model decides WHAT).
@@ -801,13 +825,18 @@ function exitSync(): void {
   } catch (e) { errLog("exit save err: " + String(e)) }
 }
 
-export default (async ({ client }: any) => {
+// Shared runtime init for both entrypoints (V1 server() and V2 setup()).
+// Runs once per process: on V2 the server may instantiate one plugin per
+// location, but timers, exit handlers and the startup sync must not repeat.
+function initRuntime(client: any): void {
   tuiClient = client || null
+  if (runtimeInit) return
+  runtimeInit = true
   mkdirSync(OUT_DIR, { recursive: true, mode: 0o700 })
   mkdirSync(HOOK_STATE_DIR, { recursive: true })
-  const autoInject = isAutoInjectEnabled()
-  const identity = readIdentity()
-  const interval = saveInterval()
+  autoInject = isAutoInjectEnabled()
+  identity = readIdentity()
+  interval = saveInterval()
   log(`loaded (autoInjectContext: ${autoInject}, saveInterval: ${interval})`)
 
   // Catch anything missed by a previous run (e.g. content skipped when
@@ -817,6 +846,7 @@ export default (async ({ client }: any) => {
   // Startup toast (delayed so the TUI is attached): shows exactly which
   // plugin build is loaded — no more guessing npm-cache vs local build —
   // plus pending backlog so a restarted-into-backlog state is visible.
+  // (No TUI client on V2 server runtime: toast() degrades to a silent no-op.)
   setTimeout(() => {
     toast("info", "MemPalace", `${pluginName()} v${pluginVersion()} loaded${countPendingSuffix()}`)
     log(`startup toast fired (${pluginName()} v${pluginVersion()})`)
@@ -836,9 +866,14 @@ export default (async ({ client }: any) => {
   process.once("SIGTERM", onExit)
   process.once("SIGHUP", onExit)
   process.once("exit", onExit)
+}
+
+// V1 entrypoint (object form, supported by OpenCode >= 1.18.29).
+async function server({ client }: any): Promise<any> {
+  initRuntime(client)
 
   return {
-    "chat.message": async (input, output) => {
+    "chat.message": async (input: any, output: any) => {
       const role = (output.message as any).role
       if (role !== "user") return
       const text = hasText(output.parts || [])
@@ -867,7 +902,7 @@ export default (async ({ client }: any) => {
       persistCounters(counters)
     },
 
-    "experimental.chat.messages.transform": async (_input, output) => {
+    "experimental.chat.messages.transform": async (_input: any, output: any) => {
       if (!output?.messages?.length) return
 
       const injectParts: any[] = []
@@ -929,7 +964,7 @@ export default (async ({ client }: any) => {
     // Official PreCompact pattern: compaction ALWAYS warrants a save.
     // Instruct the model to file everything via MCP now, and re-attach
     // identity + wake-up context so the summary cannot lose them (rescue).
-    "experimental.session.compacting": async (input, output) => {
+    "experimental.session.compacting": async (input: any, output: any) => {
       const sessionID = (input as any)?.sessionID || "unknown"
       log(`compacting session ${sessionID} - emergency save + rescue`)
       hookLog(`pre-compact emergency save for session ${sessionID}`)
@@ -943,7 +978,7 @@ export default (async ({ client }: any) => {
       }
     },
 
-    "tool.execute.after": async (input, output) => {
+    "tool.execute.after": async (input: any, output: any) => {
       try {
         const name = (input as any)?.tool || ""
         if (!isMemPalaceTool(name)) return
@@ -974,4 +1009,135 @@ export default (async ({ client }: any) => {
       }
     },
   }
-}) satisfies Plugin
+}
+
+// V2 entrypoint: 1:1 port of the V1 hooks above onto the V2 plugin API
+// (Plugin.define + ctx hook registrations). Shared helpers and module
+// state are reused verbatim; only the event shapes changed.
+const mempalaceV2 = PluginV2.define({
+  id: "opencode-mempalace-persistence",
+  async setup(ctx) {
+    initRuntime(null)
+
+    // Port of V1 "chat.message": count admitted human prompts per session,
+    // arm one AI checkpoint per save-interval boundary.
+    await ctx.session.hook("prompt", (event: any) => {
+      if (!rememberPromptID(String(event?.messageID || ""))) return
+      const text = (event?.prompt?.text || "").trim()
+      if (!text) return
+      const sessionID = event?.sessionID || "global"
+      const counters = loadCounters()
+      const c = counters[sessionID] || { humanMsgs: 0, lastCheckpoint: 0 }
+      c.humanMsgs += 1
+      const boundary = Math.floor(c.humanMsgs / interval)
+      if (boundary > c.lastCheckpoint) {
+        c.lastCheckpoint = boundary
+        pendingCheckpoint = { sessionID, count: c.humanMsgs }
+        hookLog(`session ${sessionID}: ${c.humanMsgs} human msgs — checkpoint armed`)
+        ilog("checkpoint", { sessionID, count: c.humanMsgs })
+        toast("info", "MemPalace", `checkpoint armed (~${c.humanMsgs} msgs): the model will file memories now`)
+      }
+      counters[sessionID] = c
+      persistCounters(counters)
+    })
+
+    // Port of V1 "experimental.chat.messages.transform": inject the armed
+    // checkpoint, identity and recall hits as text parts of the last user
+    // message (V2 Message shape: { role, content: [{ type: "text", text }] }).
+    await ctx.session.hook("context", (event: any) => {
+      const messages = event?.messages
+      if (!Array.isArray(messages) || messages.length === 0) return
+      const lastUser = [...messages].reverse().find((m: any) => m?.role === "user")
+      const injectTexts: string[] = []
+      if (pendingCheckpoint && lastUser) {
+        injectTexts.push(checkpointInstruction(pendingCheckpoint.count))
+        log(`checkpoint injected (~${pendingCheckpoint.count} msgs)`)
+        hookLog(`checkpoint injected for session ${pendingCheckpoint.sessionID}`)
+        pendingCheckpoint = null
+      }
+      if (autoInject && lastUser) {
+        const query = (lastUser.content || [])
+          .filter((p: any) => p?.type === "text" && p?.text?.trim())
+          .map((p: any) => String(p.text).trim())
+          .join("\n")
+        if (!wakeupDone) {
+          wakeupDone = true
+          if (identity) injectTexts.push(`[MemPalace Identity]\n${identity}\n[/MemPalace Identity]`)
+        }
+        if (query) {
+          const memories = mempalaceSearch(query)
+          if (memories) injectTexts.push(`[MemPalace Recall]\n${memories}\n[/MemPalace Recall]`)
+        }
+      }
+      if (injectTexts.length > 0 && lastUser) {
+        lastUser.content ??= []
+        for (const text of injectTexts) lastUser.content.push({ type: "text", text })
+        log(`injected ${injectTexts.length} context blocks`)
+      }
+    })
+
+    // Port of V1 "experimental.session.compacting": V2 has no output.context,
+    // so the emergency-save + rescue instructions go to the summary
+    // request's system prompt instead.
+    await ctx.session.hook("compaction", (event: any) => {
+      const sessionID = event?.sessionID || "unknown"
+      log(`compacting session ${sessionID} - emergency save + rescue`)
+      hookLog(`pre-compact emergency save for session ${sessionID}`)
+      if (!Array.isArray(event?.system)) return
+      event.system.push({ type: "text", text: precompactInstruction() })
+      const rescue: string[] = []
+      if (identity) rescue.push(`[MemPalace Identity]\n${identity}`)
+      const wakeup = mempalaceWakeup()
+      if (wakeup) rescue.push(`[MemPalace Wake-up]\n${wakeup}`)
+      if (rescue.length > 0) {
+        event.system.push({ type: "text", text: `[MemPalace Rescue — core memory, must survive compaction]\n${rescue.join("\n\n")}` })
+      }
+    })
+
+    // Port of V1 "tool.execute.after": V2 delivers one event with
+    // { tool, input, status, result | error } instead of (input, output).
+    await ctx.tool.hook("execute.after", (event: any) => {
+      try {
+        const name = event?.tool || ""
+        if (!isMemPalaceTool(name)) return
+        const out = event?.status === "completed"
+          ? event?.result
+          : { output: String(event?.error?.message || event?.error || "") }
+        const summary = summarizeToolCall(name, event?.input, out)
+        log(`tool: ${summary}`)
+        toast("info", "MemPalace", summary)
+        const outAny = (out as any) || {}
+        ilog("tool", {
+          tool: String(name).replace(/^mcp_+/, "").replace(/^mempalace_mempalace_/, "").replace(/^mempalace_/, ""),
+          asked: (() => { try { return JSON.stringify(event?.input || {}).replace(/\s+/g, " ").slice(0, 200) } catch { return "" } })(),
+          answered: extractResultText(out).replace(/\s+/g, " ").slice(0, 300),
+          shape: {
+            keys: Object.keys(outAny),
+            title: outAny.title,
+            metaKeys: outAny.metadata && typeof outAny.metadata === "object" ? Object.keys(outAny.metadata) : typeof outAny.metadata,
+            raw: JSON.stringify(outAny).slice(0, 300),
+          },
+        })
+      } catch {}
+    })
+
+    // Port of the V1 `event` hook: mine on idle/exit of a session.
+    const controller = new AbortController()
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          const type = (event as any)?.type
+          if (type === "session.idle" || type === "session.deleted") {
+            log(`${type} - queue sync`)
+            setTimeout(() => dbSync(), 3000)
+          }
+        }
+      } catch {}
+    })()
+    return () => controller.abort()
+  },
+})
+
+// Dual entrypoint: V2 calls setup(), V1 (>= 1.18.29) calls server().
+// The V1 hook implementation above is untouched, so opencode-v1 keeps working.
+export default { ...mempalaceV2, server }
