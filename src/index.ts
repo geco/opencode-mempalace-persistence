@@ -487,17 +487,33 @@ function exportNewSessions(
   cursorFor: (wing: string | null) => number,
 ): { wings: Map<string, string[]>; now: number; exportedIds: Map<string, Map<string, number>> } {
   const sinceMs = cursorFor(null)
+  // Dual schema. OpenCode v2 stores live sessions in `session_v2` +
+  // `session_message` (content inside the message JSON), while v1 used
+  // `session` + `message` + `part` rows. Both are read so a v1 -> v2
+  // migration never strands messages written before the switch: v2 wins
+  // for ids present in both (it is the live schema), v1 fills the rest.
   const sessions = runPython(`
 import sqlite3, json
 db = sqlite3.connect(${JSON.stringify(OPENCODE_DB)})
-rows = db.execute("""
-  SELECT DISTINCT s.id, s.title, p.worktree, s.directory, s.slug, s.time_created
-  FROM session s
-  LEFT JOIN project p ON s.project_id = p.id
-  INNER JOIN message m ON m.session_id = s.id
-  WHERE m.time_created > ${sinceMs}
-  ORDER BY s.time_created
-""").fetchall()
+def has(t):
+    return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (t,)).fetchone() is not None
+sessions = {}
+if has("session_v2") and has("session_message"):
+    for sid, title, directory, newest in db.execute("""
+      SELECT sm.session_id, s.title, s.directory, MAX(sm.time_created)
+      FROM session_message sm JOIN session_v2 s ON s.id = sm.session_id
+      WHERE sm.time_created > ${sinceMs} GROUP BY sm.session_id
+    """).fetchall():
+        sessions[sid] = [sid, title, directory, newest, "v2"]
+if has("session") and has("message"):
+    for sid, title, directory, newest in db.execute("""
+      SELECT m.session_id, s.title, s.directory, MAX(m.time_created)
+      FROM message m JOIN session s ON s.id = m.session_id
+      WHERE m.time_created > ${sinceMs} GROUP BY m.session_id
+    """).fetchall():
+        if sid not in sessions:
+            sessions[sid] = [sid, title, directory, newest, "v1"]
+rows = sorted(sessions.values(), key=lambda r: r[3])
 db.close()
 print(json.dumps(rows))
 `)
@@ -521,7 +537,7 @@ print(json.dumps(rows))
 
   for (const sess of sessionsArr) {
   try {
-    const [sessId, title, , directory] = sess
+    const [sessId, title, directory, , schema] = sess
     const wing = (((directory as string) || "").split("/").filter(Boolean).pop() || "global")
       .replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 40) || "global"
     const label = (title || "").replace(/[^a-zA-Z0-9 _-]/g, "_") || (sessId || "").slice(0, 12)
@@ -529,47 +545,71 @@ print(json.dumps(rows))
     const wingSince = cursorFor(wing)
 
     const msgs = runPython(`
-import sqlite3, json
+import sqlite3, json, time
 db = sqlite3.connect(${JSON.stringify(OPENCODE_DB)})
-rows = db.execute("""
-  SELECT m.id, m.time_created, m.data FROM message m
-  WHERE m.session_id = ${JSON.stringify(sessId)} AND m.time_created > ${wingSince}
-  ORDER BY m.time_created
-""").fetchall()
+now_ms = int(time.time() * 1000)
+STALE_PART_MS = 30 * 60 * 1000
+STALE_EMPTY_MS = 10 * 60 * 1000
 texts = []
 incomplete = []
-for (mid, mts, mdata_raw) in rows:
-    try: mdata = json.loads(mdata_raw)
-    except: mdata = {}
-    role = mdata.get("role", "unknown")
-    # Completion tracking (see PR #1524 review): the assistant message row
-    # is created when a reply STARTS, parts stream in afterwards, and
-    # finish is set only on completion. Exporting mid-reply would
-    # snapshot partial parts while the cursor advances past the message
-    # timestamp — losing the rest of the reply forever. So unfinished
-    # replies are skipped and revisited next sync — BUT only while
-    # recently active. A reply with no new parts for a while is dead
-    # (killed session, crashed run): treating it as perpetually
-    # in-flight would pin the cursor forever (seen live: a stillborn
-    # message froze sync for 7h). Dead replies are exported as-is.
-    now_ms = int(__import__("time").time() * 1000)
-    STALE_PART_MS = 30 * 60 * 1000
-    STALE_EMPTY_MS = 10 * 60 * 1000
-    if role == "assistant" and not mdata.get("finish"):
-        max_part = db.execute("SELECT MAX(time_created) FROM part WHERE message_id = ?", (mid,)).fetchone()[0]
-        if max_part is None:
-            alive = (now_ms - mts) < STALE_EMPTY_MS
-        else:
-            alive = (now_ms - max_part) < STALE_PART_MS
-        if alive:
-            incomplete.append(mts)
-            continue
-    for (pdata_raw,) in db.execute("SELECT data FROM part WHERE message_id = ? ORDER BY time_created", (mid,)).fetchall():
-        try:
-            pdata = json.loads(pdata_raw)
-            if pdata.get("type") == "text" and pdata.get("text","").strip():
-                texts.append({"mid": mid, "role": role, "text": pdata.get("text").strip(), "ts": mts})
-        except: pass
+
+# Completion tracking (see PR #1524 review): an assistant message row is
+# created when a reply STARTS and is marked complete only afterwards, so
+# exporting mid-reply would snapshot partial content while the cursor
+# advances past its timestamp, losing the rest of the reply forever.
+# Unfinished replies are skipped and revisited by the next sync, BUT only
+# while recently active: a reply with no new content for a while is dead
+# (killed session, crashed run) and treating it as perpetually in-flight
+# pinned the cursor forever (seen live: a stillborn message froze sync
+# for 7h). Dead replies are exported as-is.
+if ${JSON.stringify(schema)} == "v2":
+    rows = db.execute("""
+      SELECT id, time_created, time_updated, type, data FROM session_message
+      WHERE session_id = ? AND time_created > ? ORDER BY time_created, seq
+    """, (${JSON.stringify(sessId)}, ${wingSince})).fetchall()
+    for mid, mts, mupd, mtype, mdata_raw in rows:
+        try: mdata = json.loads(mdata_raw)
+        except: mdata = {}
+        role = mtype or mdata.get("role", "unknown")
+        finished = bool(mdata.get("finish")) or bool((mdata.get("time") or {}).get("completed"))
+        if role == "assistant" and not finished:
+            alive = (now_ms - (mupd or mts)) < (STALE_PART_MS if mupd else STALE_EMPTY_MS)
+            if alive:
+                incomplete.append(mts)
+                continue
+        for block in mdata.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "text" and str(block.get("text") or "").strip():
+                texts.append({"mid": mid, "role": role, "text": str(block["text"]).strip(), "ts": mts})
+        # v2 stores the human turn as a plain "text" field on the message
+        # (assistant turns use the content[] blocks above) -- without this
+        # every prompt would be missing from the transcript.
+        if str(mdata.get("text") or "").strip():
+            texts.append({"mid": mid, "role": role, "text": str(mdata["text"]).strip(), "ts": mts})
+else:
+    rows = db.execute("""
+      SELECT m.id, m.time_created, m.data FROM message m
+      WHERE m.session_id = ? AND m.time_created > ?
+      ORDER BY m.time_created
+    """, (${JSON.stringify(sessId)}, ${wingSince})).fetchall()
+    for mid, mts, mdata_raw in rows:
+        try: mdata = json.loads(mdata_raw)
+        except: mdata = {}
+        role = mdata.get("role", "unknown")
+        if role == "assistant" and not mdata.get("finish"):
+            max_part = db.execute("SELECT MAX(time_created) FROM part WHERE message_id = ?", (mid,)).fetchone()[0]
+            if max_part is None:
+                alive = (now_ms - mts) < STALE_EMPTY_MS
+            else:
+                alive = (now_ms - max_part) < STALE_PART_MS
+            if alive:
+                incomplete.append(mts)
+                continue
+        for (pdata_raw,) in db.execute("SELECT data FROM part WHERE message_id = ? ORDER BY time_created", (mid,)).fetchall():
+            try:
+                pdata = json.loads(pdata_raw)
+                if pdata.get("type") == "text" and pdata.get("text","").strip():
+                    texts.append({"mid": mid, "role": role, "text": pdata.get("text").strip(), "ts": mts})
+            except: pass
 db.close()
 print(json.dumps({"texts": texts, "incomplete": incomplete}))
 `)

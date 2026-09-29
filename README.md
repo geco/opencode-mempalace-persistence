@@ -45,6 +45,13 @@ plugin runs in the server runtime, which has no `tui.showToast`, so TUI
 toasts are silent there — `hook.log`, `interactions.log`, `/memory-status`
 and `/memory-log` are unaffected.
 
+The transcript export reads **both** database layouts, so a v1 → v2
+migration never strands messages: v2 sessions (`session_v2` +
+`session_message`, human turn in `data.text`, replies in `data.content[]`)
+and v1 sessions (`session` + `message` + `part`) are unioned by session id,
+with v2 winning where both exist. Sessions still readable only in the v1
+tables (e.g. one created by v1 right before the switch) are exported too.
+
 ### 2. Identity (who you are)
 
 Create `~/.mempalace/identity.txt`:
