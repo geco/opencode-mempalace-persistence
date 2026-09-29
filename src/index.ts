@@ -98,13 +98,27 @@ import sqlite3, json, re
 db = sqlite3.connect(${JSON.stringify(OPENCODE_DB)})
 cursors = json.loads(${JSON.stringify(JSON.stringify(st.wings || {}))})
 default = ${st.last_sync_ms || 0}
-rows = db.execute("""
-  SELECT s.directory, m.time_created FROM message m
-  INNER JOIN session s ON s.id = m.session_id
-""").fetchall()
+def has(t):
+    return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (t,)).fetchone() is not None
+rows = []
+# Same dual-schema rule as the export: v2 is the live layout, v1 is read
+# only as a fill-in (a v1 -> v2 migration leaves older messages there).
+if has("session_v2") and has("session_message"):
+    rows += db.execute("""
+      SELECT s.directory, sm.time_created, sm.id FROM session_message sm
+      JOIN session_v2 s ON s.id = sm.session_id
+    """).fetchall()
+if has("session") and has("message"):
+    rows += db.execute("""
+      SELECT s.directory, m.time_created, m.id FROM message m
+      JOIN session s ON s.id = m.session_id
+    """).fetchall()
 db.close()
 by = {}
-for (directory, mts) in rows:
+seen = set()
+for directory, mts, mid in rows:
+    if mid in seen: continue
+    seen.add(mid)
     base = ((directory or "").rstrip("/").split("/") or ["global"])[-1] or "global"
     wing = re.sub("[^a-zA-Z0-9_-]", "_", base)[:40] or "global"
     if mts > cursors.get(wing, default):
@@ -529,6 +543,10 @@ print(json.dumps(rows))
   const wings = new Map<string, string[]>()
   // Already-mined IDs loaded ONCE per export (state file can be MBs).
   const seen = loadMinedIds()
+  // Wings that actually received an export file in this run. The cursor
+  // advances for these and ONLY these, right here — see the cursor note
+  // below: the export cursor means "written", not "mined".
+  const writtenWings = new Set<string>()
   // Message IDs written to export files, PER WING. Recorded only when
   // that wing mines successfully — recording another wing's IDs early
   // would skip its content forever on failure.
@@ -652,6 +670,7 @@ print(json.dumps({"texts": texts, "incomplete": incomplete}))
     mkdirSync(wingDir, { recursive: true, mode: 0o700 })
     const fname = `sync_${prefix}_${contentHash}.txt`
     writeFileSync(join(wingDir, fname), content + "\n", { mode: 0o600 })
+    writtenWings.add(wing)
     if (!exportedByWing.has(wing)) exportedByWing.set(wing, new Map())
     const wingIds = exportedByWing.get(wing)!
     for (const m of msgList) {
@@ -668,6 +687,28 @@ print(json.dumps({"texts": texts, "incomplete": incomplete}))
     } catch {}
     continue
   }
+  }
+
+  // The cursor advances HERE, on a successful write — not after the mine.
+  //
+  // Why: the export is cheap and idempotent (same content -> same filename,
+  // so a re-export overwrites itself), while the mine is expensive and fails
+  // for reasons outside our control (lock contention, exit kill, OOM). When
+  // the cursor waited for the mine, a mine that never finished pinned it
+  // forever: every later export re-cut the window from the stale cursor, and
+  // since the session kept growing each file was a SUPERSET of the previous
+  // one. 691 overlapping files were produced that way, and mining them all
+  // multiplied every message by up to 691 (628k drawers, 5GB).
+  //
+  // Advancing on write keeps every window disjoint: the next export starts
+  // where this one stopped. Nothing is lost when a mine fails — the pending
+  // file IS the queue, and the next mine picks it up untouched.
+  //
+  // `cursor` is the running minimum over in-flight replies, so this never
+  // skips past a reply that was still streaming when we looked.
+  for (const wing of writtenWings) markSynced(cursor, wing)
+  if (writtenWings.size > 0) {
+    log(`cursors advanced on write: ${[...writtenWings].join(", ")} -> ${new Date(cursor).toISOString()}`)
   }
 
   return { wings, now: cursor, exportedIds: exportedByWing }
@@ -720,8 +761,28 @@ function wingCount(wings: Map<string, string[]>): number {
   return n
 }
 
+// Queue alarm. A pile of pending files means mines are not draining: the
+// palace silently stops receiving memories while the transcript DB keeps
+// growing. This exact silence is what hid the 5GB blow-up, so it is worth a
+// line in hook.log (and therefore in /memory-status) at a low threshold.
+const BACKLOG_ALARM_FILES = 20
+function warnIfBacklogPiling(): void {
+  const pending = countPendingFiles()
+  if (pending <= BACKLOG_ALARM_FILES) return
+  const perWing: string[] = []
+  try {
+    for (const w of readdirSync(SYNC_DIR, { withFileTypes: true })) {
+      if (!w.isDirectory()) continue
+      const n = readdirSync(join(SYNC_DIR, w.name)).length
+      if (n > 0) perWing.push(`${w.name}=${n}`)
+    }
+  } catch {}
+  hookLog(`WARNING: ${pending} exported files waiting to be mined (${perWing.join(" ") || "?"}) — mines are not draining, the palace is falling behind`)
+}
+
 function doDbSync(): void {
   if (lastSyncTs && Date.now() - lastSyncTs < 5000) return
+  try { warnIfBacklogPiling() } catch {}
 
   const sinceMs = backfillRequested() ? 0 : getLastSync()
   if (backfillRequested()) log("backfill requested: exporting full history")
@@ -729,7 +790,7 @@ function doDbSync(): void {
     ? (_wing: string | null) => 0
     : (wing: string | null) => (wing ? getLastSync(wing) : getLastSync())
 
-  const { wings, now, exportedIds } = exportNewSessions(cursorFor)
+  const { wings, exportedIds } = exportNewSessions(cursorFor)
   if (wings.size === 0) return
 
   miningLock = true
@@ -805,11 +866,11 @@ function doDbSync(): void {
       }
       log(`mined wing ${wing} (${files.length} sessions)`)
       wingDrawers.set(wing, parseDrawers(stdout))
-      // Per-wing cursor: this wing's progress is banked even if a later
-      // wing fails — the counter never stalls on one slow wing again.
+      // The cursor already advanced when these files were written, so a
+      // successful mine has no cursor work left to do — it only files the
+      // content and releases the queue.
       // Only THIS wing's message IDs are recorded: other wings' content
       // is not filed yet, recording it would skip it forever on failure.
-      markSynced(now, wing)
       commitExportedIds(new Map([[wing, exportedIds.get(wing) || new Map()]]))
       for (const f of files) { try { unlinkSync(f) } catch {} }
       try { rmdirSync(join(OUT_DIR, wing)) } catch {}
@@ -834,7 +895,7 @@ function exitSync(): void {
   try {
     const bin = resolveBin()
     if (!bin) return
-    const { wings, now, exportedIds } = exportNewSessions((wing) => (wing ? getLastSync(wing) : getLastSync()))
+    const { wings, exportedIds } = exportNewSessions((wing) => (wing ? getLastSync(wing) : getLastSync()))
     if (wings.size === 0) return
     const deadline = Date.now() + EXIT_BUDGET_MS
     const done: string[] = []
@@ -852,7 +913,6 @@ function exitSync(): void {
         errLog(`exit mine err (${wing}): ${String(why)}`)
         return
       }
-      markSynced(now, wing)
       commitExportedIds(new Map([[wing, exportedIds.get(wing) || new Map()]]))
       done.push(wing)
     }

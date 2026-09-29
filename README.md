@@ -227,6 +227,19 @@ Every turn (question + answer) is saved as a drawer in MemPalace. Mining runs wi
 
 Each opencode message is exported **exactly once ever**: exported message IDs are tracked in `sync_state.json` (retained 90 days / 200k entries) and skipped on later runs. This kills the main duplicate source mempalace's file-level dedup cannot catch — repeated boilerplate (e.g. system prompts re-sent every turn) landing in different export files. (`mempalace dedup` only compares drawers from the *same* source file, so it can't fix that either.)
 
+### The cursor means "exported", not "mined"
+
+The per-wing cursor advances **when an export file is written**, not when its mine succeeds. That distinction is the whole ballgame:
+
+- The export is cheap and idempotent — same content produces the same filename, so a re-export overwrites itself.
+- The mine is expensive and fails for reasons outside the plugin's control (palace lock held by another writer, killed at exit, OOM).
+
+An earlier version advanced the cursor only after a successful mine. A mine that never finished therefore pinned the cursor forever: every later export re-cut its window from the same stale point, and because the session kept growing, each file was a **superset** of the previous one. One long-running session produced 691 overlapping files, and mining them all multiplied every message by up to 691 — 628k drawers, 5 GB, with no error anywhere.
+
+With the cursor on write, windows are always disjoint: the next export starts where the last one stopped. A failed mine loses nothing — **the pending file *is* the queue**, and the next mine picks it up untouched.
+
+If the queue stops draining (mines blocked or too slow), `hook.log` gets a `WARNING: N exported files waiting to be mined` line, visible in `/memory-status`. Silence there is what hid the blow-up.
+
 ### Backfill existing sessions
 
 To mine the full opencode history once (e.g. on first install):
