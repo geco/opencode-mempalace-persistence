@@ -105,11 +105,18 @@ const ago = (iso?: string) => {
   return `${Math.round(s / 3600)}h fa`
 }
 
+// "idle" means no mine is running, NOT that there is nothing to do. A queue
+// waiting to be drained while the plugin sits idle is exactly the state that
+// needed surfacing, and reporting it as plain idle is what made a stuck
+// 16-file queue look healthy. Backlog is its own state, and it is not green.
+const backlogged = (s: Status) => s.phase === "idle" && s.pending > 0
+
 const describe = (s: Status) => {
   const l = s.last
-  if (!l) return "nessuna attivita"
+  if (!l) return backlogged(s) ? "coda in attesa" : "nessuna attivita"
   if (l.kind === "mine") {
     if (l.outcome === "ok") return `mine ok · ${l.drawers ?? 0} drawer`
+    if (l.outcome === "busy") return "palace occupato, si ritenta"
     return `mine ${l.outcome ?? "?"}`
   }
   if (l.kind === "checkpoint") return "checkpoint armato"
@@ -167,6 +174,9 @@ export default {
       if (p === "busy") return skin.warning
       if (p === "mining") return skin.accent
       if (p === "unknown") return skin.muted
+      // A drained queue is genuinely idle; a queue with work in it is not,
+      // and must not be reported as if it were.
+      if (backlogged(status())) return skin.warning
       return skin.success
     }
 
@@ -190,7 +200,9 @@ export default {
               <text fg={tone()}>
                 <span style={{ fg: tone() }}>◆</span> MemPalace
               </text>
-              <text fg={skin.muted}>{PHASE_LABEL[s.phase] ?? s.phase}</text>
+              <text fg={backlogged(s) ? skin.warning : skin.muted}>
+                {backlogged(s) ? "coda" : PHASE_LABEL[s.phase] ?? s.phase}
+              </text>
             </box>
             <text fg={tone()}>{gaugeLine()}</text>
             <text fg={skin.muted}>

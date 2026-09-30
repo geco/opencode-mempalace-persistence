@@ -1060,6 +1060,15 @@ function doDbSync(): void {
 // mine takes ownership (see PR #1524 review).
 const EXIT_BUDGET_MS = 45000
 const EXIT_WING_TIMEOUT_MS = 30000
+// A wing whose queue is bigger than this cannot be mined inside the exit
+// budget, and trying anyway is worse than not trying: the mine is killed at
+// the timeout having filed part of the backlog, and the next startup faces
+// the same wall. Measured on a 1-core VPS: 6.6 MB of conversations took over
+// 40 minutes, so the budget is not close. A backlog this size is drained by
+// the in-session mine, which has no timeout by design — the exit path only
+// exists to catch up on the small tail.
+const EXIT_MAX_QUEUE_BYTES = 2 * 1024 * 1024
+
 function exitSync(): void {
   try {
     const bin = resolveBin()
@@ -1071,6 +1080,19 @@ function exitSync(): void {
     for (const [wing] of wings) {
       const remaining = deadline - Date.now()
       if (remaining <= 0) { log("exit save: budget exhausted, rest covered next startup"); break }
+      const files = wings.get(wing) || []
+      let bytes = 0
+      for (const f of files) {
+        try { bytes += statSync(f).size } catch {}
+      }
+      if (bytes > EXIT_MAX_QUEUE_BYTES) {
+        log(
+          `exit save: wing ${wing} has ${files.length} files / ${(bytes / 1048576).toFixed(1)}MB, ` +
+            `over the ${(EXIT_MAX_QUEUE_BYTES / 1048576).toFixed(0)}MB the exit budget can cover — ` +
+            `left for the in-session mine (no timeout), not killed halfway here`,
+        )
+        continue
+      }
       log(`exit save: mining wing ${wing}`)
       const res = spawnSync(bin, mineArgs(join(OUT_DIR, wing), wing), {
         encoding: "utf-8",
