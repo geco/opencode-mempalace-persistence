@@ -39,6 +39,10 @@ type Status = {
   last?: { kind?: string; outcome?: string; drawers?: number; wing?: string; at?: string }
   error?: string
   plugin?: string
+  wingIndex?: number
+  wingsTotal?: number
+  drawersBaseline?: number
+  drawersNow?: number
 }
 
 const readStatus = (): Status => {
@@ -152,22 +156,41 @@ const PHASE_LABEL: Record<Phase, string> = {
   unknown: "in attesa",
 }
 
+// Thousand grouping, Italian style, done by hand: toLocaleString("it-IT")
+// silently returns ungrouped digits on runtimes without full ICU data
+// (seen: "1240" instead of "1.240"), and a counter that sometimes groups
+// and sometimes does not is worse than one that never does.
+const grouped = (n: number) =>
+  String(Math.trunc(Math.abs(n))).replace(/\B(?=(\d{3})+(?!\d))/g, ".")
+
 // The one line that answers both questions, with each clock attached to the
 // thing it measures:
 //
-//   mining  -> how long the current mine has been running
+//   mining  -> how long the current mine has been running, which wing of the
+//              run it is on, and how many drawers the palace has gained
 //   backlog -> how long the oldest queued file has been waiting
 //   drained -> nothing to wait for
 //
 // No percentage: the mine CLI exposes no total to divide by, and an invented
-// one reads as a job stuck at 99%. No "last event" text either — it was the
-// third clock on the line, and it mixed "when something was logged" with
-// "when the status file was written", which is how "coda in attesa 11m fa"
-// came to look like it meant something it did not.
+// one reads as a job stuck at 99%. Per-FILE progress does not exist either —
+// the miner walks the files silently and only the final summary says what
+// was filed — so the "current item" is the wing (known upfront, the plugin
+// mines wing by wing) plus the live drawer count. A negative delta (a
+// concurrent prune removed rows mid-run) is omitted rather than shown.
 const summary = (s: Status, q: Queue) => {
   if (working(s)) {
     const since = s.ts ? Date.parse(s.ts) : 0
-    return `${q.count} in coda · avanza da ${since ? span(since) : "poco"}`
+    const wing =
+      typeof s.wingsTotal === "number" && s.wingsTotal > 1 ? ` · wing ${(s.wingIndex ?? 0) + 1} di ${s.wingsTotal}` : ""
+    let grown = ""
+    if (
+      typeof s.drawersBaseline === "number" &&
+      typeof s.drawersNow === "number" &&
+      s.drawersNow - s.drawersBaseline >= 0
+    ) {
+      grown = ` · +${grouped(s.drawersNow - s.drawersBaseline)} drawer`
+    }
+    return `${q.count} in coda · avanza da ${since ? span(since) : "poco"}${wing}${grown}`
   }
   if (q.count > 0) {
     const age = q.oldest ? span(q.oldest) : "poco"
@@ -233,11 +256,17 @@ export default {
 
     // The header word: the state of the WORK, not of the process. A queue
     // held by another writer is "bloccato", which is a different problem with
-    // a different fix than a queue nobody has got to yet.
+    // a different fix than a queue nobody has got to yet. While mining, the
+    // wing counter says which slice of the run this is.
     const label = () => {
       const s = status()
       const q = queue()
-      if (working(s)) return PHASE_LABEL[s.phase] ?? s.phase
+      if (s.phase === "mining") {
+        if (typeof s.wingsTotal === "number" && s.wingsTotal > 1) {
+          return `mining · wing ${(s.wingIndex ?? 0) + 1} di ${s.wingsTotal}`
+        }
+        return PHASE_LABEL[s.phase] ?? s.phase
+      }
       if (q.count > 0) return s.phase === "busy" || s.error ? "bloccato" : "coda"
       return PHASE_LABEL[s.phase] ?? s.phase
     }

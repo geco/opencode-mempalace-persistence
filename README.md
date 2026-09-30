@@ -360,12 +360,23 @@ The plugin exports everything in the opencode database on the next sync, then re
 The plugin ships a second entry point, `tui.tsx`, that claims the sidebar footer:
 
 ```
-◆ MemPalace  idle
-████████░░░░░░░░░░░░░░
-18 in coda · mine ok · 42 drawer  2m fa
+◆ MemPalace  coda
+██████░░░░░░░░░░░░░░░
+6 in coda · in coda da 146h
 ```
 
 What the bar shows is **queue depth, not progress** — one cell per pending file, capped at 24. It was a percentage at first and that was wrong: there is no real percentage to show (`mempalace mine` is a black box), so an animated 0→100 loop just read as a job stuck at 99%. A progress indicator that lies is the worst possible thing in a memory plugin. While a mine is actually running a `▓▓▓` window sweeps across the bar so activity is visible without inventing a number; idle, the bar is **completely still** and no timer is running.
+
+The third line answers two questions — what is left, and since when — with each clock attached to the thing it measures:
+
+```
+13 in coda · avanza da 6m · wing 2 di 3 · +1.240 drawer   a mine is running
+6 in coda · in coda da 146h                              waiting its turn
+6 in coda · bloccato da 146h · palazzo occupato          cannot be written at all
+coda vuota                                               nothing waiting
+```
+
+Per-FILE progress does not exist: the miner walks the files silently and only the final summary says what was filed, so the "current item" is the wing (the plugin mines wing by wing and knows the list upfront) plus a live count of drawers the palace has gained since the run started — a read-only `COUNT(*)` over the local Chroma sqlite, polled every 2s while a mine runs. Anything unreadable degrades to elapsed-time-only. No total exists to divide by, so there is deliberately no percentage anywhere.
 
 Two details cost real time to find, both from `packages/plugin/src/host.ts`:
 

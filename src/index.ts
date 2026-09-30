@@ -93,12 +93,70 @@ function writeStatus(force = false): void {
         last: statusLast || undefined,
         error: statusError || undefined,
         plugin: `${pluginName()} v${pluginVersion()}`,
+        wingIndex: mineWingsTotal > 0 ? mineWingIndex : undefined,
+        wingsTotal: mineWingsTotal > 0 ? mineWingsTotal : undefined,
+        drawersBaseline: mineDrawersBaseline >= 0 ? mineDrawersBaseline : undefined,
+        drawersNow: mineDrawersNow >= 0 ? mineDrawersNow : undefined,
       }),
       { mode: 0o600 },
     )
   } catch (e) {
     log("status write err: " + String(e))
   }
+}
+
+// Live mine progress.
+//
+// The mine CLI prints nothing until it exits, so per-FILE progress does not
+// exist to an outside observer: the miner walks the files silently and only
+// the final summary says what was filed. Faking a per-file counter would be
+// the percentage lie all over again. What DOES exist is the palace itself,
+// which grows while the mine runs. So the "current item" is reported at the
+// two granularities that are real: which wing of this run is being mined
+// (the plugin mines wing by wing and knows the list upfront), and how many
+// drawers the palace has gained since the run started.
+//
+// Both are best-effort. The drawer count is a read-only COUNT(*) over the
+// local Chroma sqlite; anything unreadable (another backend, schema change)
+// degrades the footer to elapsed-time-only instead of breaking it. The delta
+// counts every writer, so strictly it is palace growth during the run, not
+// this mine's output alone — in practice the mine is the only bulk writer
+// and MCP writes are a drawer at a time.
+let mineWingIndex = 0
+let mineWingsTotal = 0
+let mineDrawersBaseline = -1
+let mineDrawersNow = -1
+let minePoll: ReturnType<typeof setInterval> | null = null
+
+function palaceDrawersNow(): number {
+  try {
+    const db = join(HOME, "opencode-memory", "chroma.sqlite3")
+    const out = execFileSync(
+      process.env.MEMPALACE_PYTHON || "python3",
+      [
+        "-c",
+        "import sqlite3\n" +
+          `c=sqlite3.connect('file:${db}?mode=ro',uri=True,timeout=5)\n` +
+          "print(c.execute('SELECT COUNT(*) FROM embeddings').fetchone()[0])",
+      ],
+      { encoding: "utf-8", timeout: 15000 },
+    ).trim()
+    const n = parseInt(out, 10)
+    return Number.isFinite(n) && n >= 0 ? n : -1
+  } catch {
+    return -1
+  }
+}
+
+function stopMinePoll(): void {
+  if (minePoll !== null) {
+    clearInterval(minePoll)
+    minePoll = null
+  }
+  mineWingIndex = 0
+  mineWingsTotal = 0
+  mineDrawersBaseline = -1
+  mineDrawersNow = -1
 }
 
 function statusEvent(kind: string, data: Record<string, unknown> = {}): void {
@@ -951,6 +1009,18 @@ function doDbSync(): void {
   statusPhase = "mining"
   statusWing = [...wings.keys()].join(",")
   statusError = ""
+  // The run's progress baseline: which wings, and how full the palace is
+  // now. A 2s poll refreshes the live count while the mine runs; the TUI
+  // shows the delta. Cleared on every terminal path (done, error, busy).
+  stopMinePoll()
+  mineWingsTotal = wings.size
+  mineWingIndex = 0
+  mineDrawersBaseline = palaceDrawersNow()
+  mineDrawersNow = mineDrawersBaseline
+  minePoll = setInterval(() => {
+    mineDrawersNow = palaceDrawersNow()
+    writeStatus(true)
+  }, 2000)
   writeStatus(true)
   log(`mining ${wingCount(wings)} sessions across ${wings.size} wings`)
 
@@ -970,6 +1040,7 @@ function doDbSync(): void {
   const mineNext = (i: number, attempt = 0): void => {
     if (i >= entries.length) {
       miningLock = false
+      stopMinePoll()
       cleanupExport(wings)
       log("mine done")
       const names = [...wings.keys()].join(", ")
@@ -983,12 +1054,19 @@ function doDbSync(): void {
       return
     }
     const [wing, files] = entries[i]
+    // Current wing, every attempt: this also repairs the phase between
+    // wings, which used to sit at "idle" after each wing finished because
+    // only the run start set "mining".
+    mineWingIndex = i
+    statusPhase = "mining"
+    statusWing = wing
+    writeStatus(true)
     // No timeout here by design (see PR #4): Node would kill only the
     // wrapper shell and orphan the python mine process, which keeps
     // holding the palace lock while the next mine piles up. miningLock
     // already serializes concurrent mines; long mines run to completion.
     const bin = resolveBin()
-    if (!bin) { miningLock = false; errLog("mine skipped: mempalace CLI not found"); return }
+    if (!bin) { miningLock = false; stopMinePoll(); errLog("mine skipped: mempalace CLI not found"); return }
     execFile(bin, mineArgs(join(OUT_DIR, wing), wing), {
       encoding: "utf-8",
       maxBuffer: CHILD_MAX_BUFFER,
@@ -1015,6 +1093,7 @@ function doDbSync(): void {
         if (/is held by/i.test(msg)) {
           statusPhase = "busy"
           statusWing = wing
+          stopMinePoll()
           statusEvent("mine", { outcome: "busy", wing })
           log(`mine skipped, palace busy (${wing}) after ${attempt} retries — next trigger will retry`)
           ilog("mine", { outcome: "busy", wing })
@@ -1024,6 +1103,7 @@ function doDbSync(): void {
         statusPhase = "error"
         statusWing = wing
         statusError = msg.slice(0, 200)
+        stopMinePoll()
         writeStatus(true)
         toast("error", "MemPalace", `mine failed (${wing}): ${msg.slice(0, 120)}`)
         ilog("mine", { outcome: "error", wing, error: msg.slice(0, 200) })
