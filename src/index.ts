@@ -97,6 +97,8 @@ function writeStatus(force = false): void {
         wingsTotal: mineWingsTotal > 0 ? mineWingsTotal : undefined,
         drawersBaseline: mineDrawersBaseline >= 0 ? mineDrawersBaseline : undefined,
         drawersNow: mineDrawersNow >= 0 ? mineDrawersNow : undefined,
+        mineStartedAt: mineStartedAt || undefined,
+        waiting: mineWaiting || undefined,
       }),
       { mode: 0o600 },
     )
@@ -127,6 +129,16 @@ let mineWingsTotal = 0
 let mineDrawersBaseline = -1
 let mineDrawersNow = -1
 let minePoll: ReturnType<typeof setInterval> | null = null
+// When THIS run started, as an ISO string. status.json's `ts` is rewritten
+// on every status write (including the 2s progress poll and every tool-call
+// event), so it measures "time since the last write" — which is what made
+// the footer flicker between "running for 1s" and "running for 2s". Elapsed
+// time needs its own clock, set once here and never touched again.
+let mineStartedAt: string | null = null
+// True while the run is backed off waiting for the palace lock, i.e. no
+// mine process exists and no drawers are being filed. Without this the
+// footer shows a running mine with a frozen "+0 drawers" and no reason.
+let mineWaiting = false
 
 function palaceDrawersNow(): number {
   try {
@@ -157,6 +169,8 @@ function stopMinePoll(): void {
   mineWingsTotal = 0
   mineDrawersBaseline = -1
   mineDrawersNow = -1
+  mineStartedAt = null
+  mineWaiting = false
 }
 
 function statusEvent(kind: string, data: Record<string, unknown> = {}): void {
@@ -1017,6 +1031,8 @@ function doDbSync(): void {
   mineWingIndex = 0
   mineDrawersBaseline = palaceDrawersNow()
   mineDrawersNow = mineDrawersBaseline
+  mineStartedAt = new Date().toISOString()
+  mineWaiting = false
   minePoll = setInterval(() => {
     mineDrawersNow = palaceDrawersNow()
     writeStatus(true)
@@ -1058,6 +1074,7 @@ function doDbSync(): void {
     // wings, which used to sit at "idle" after each wing finished because
     // only the run start set "mining".
     mineWingIndex = i
+    mineWaiting = false
     statusPhase = "mining"
     statusWing = wing
     writeStatus(true)
@@ -1081,6 +1098,12 @@ function doDbSync(): void {
         if (/is held by/i.test(msg) && attempt < RETRY_DELAYS_MS.length) {
           const wait = jitter(RETRY_DELAYS_MS[attempt])
           log(`palace busy (${wing}), retry ${attempt + 1}/${RETRY_DELAYS_MS.length} in ${Math.round(wait / 1000)}s`)
+          // No mine process exists during the wait, so say so: otherwise the
+          // footer shows a running mine with a frozen drawer count and no
+          // reason. (log() above is dropped unless DEBUG is on, so without
+          // this flag the backoff is invisible everywhere.)
+          mineWaiting = true
+          writeStatus(true)
           const nowTs = Date.now()
           if (nowTs - lastBusyToastTs > BUSY_TOAST_WINDOW_MS) {
             lastBusyToastTs = nowTs
@@ -1212,7 +1235,7 @@ function exitSync(): void {
       // Say it once, in the status the TUI reads, so the footer can say WHY
       // the queue is not draining instead of leaving the user to guess.
       statusPhase = "busy"
-      statusError = "palazzo occupato da un altro processo"
+      statusError = "palace held by another process"
       writeStatus(true)
       log("exit save: palace is held by another process — queue left for the in-session mine")
     }

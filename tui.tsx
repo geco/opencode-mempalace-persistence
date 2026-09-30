@@ -43,6 +43,8 @@ type Status = {
   wingsTotal?: number
   drawersBaseline?: number
   drawersNow?: number
+  mineStartedAt?: string
+  waiting?: boolean
 }
 
 const readStatus = (): Status => {
@@ -131,9 +133,9 @@ const sweep = (pending: number, step: number) => {
   return cells.join("")
 }
 
-// How long something has been going, as a short span. No "fa": the label
-// already says what is being measured ("avanza da", "fermo da"), and a second
-// clock in the same line was what made the previous version unreadable.
+// How long something has been going, as a short span. The label already says
+// what is being measured ("running for", "waiting"), and a second clock on
+// the same line was what made an earlier version unreadable.
 const span = (ms: number) => {
   const s = Math.max(0, Math.round((Date.now() - ms) / 1000))
   if (s < 60) return `${s}s`
@@ -145,23 +147,28 @@ const span = (ms: number) => {
 // waiting to be drained while the plugin sits idle is exactly the state that
 // needed surfacing, and reporting it as plain idle is what made a stuck
 // 16-file queue look healthy. Backlog is its own state, and it is not green.
-const working = (s: Status) => s.phase === "mining" || s.phase === "busy"
+//
+// working() is "mining" only. "busy" is always terminal — it is set when the
+// retries are exhausted and the run is over — so treating it as active showed
+// a dead run as "running for just started". While backing off between
+// retries the phase stays "mining" with waiting=true instead.
+const working = (s: Status) => s.phase === "mining"
 const backlogged = (s: Status, q: Queue) => !working(s) && q.count > 0
 
 const PHASE_LABEL: Record<Phase, string> = {
   idle: "idle",
   mining: "mining",
-  busy: "palace occupato",
-  error: "errore",
-  unknown: "in attesa",
+  busy: "palace busy",
+  error: "error",
+  unknown: "waiting",
 }
 
-// Thousand grouping, Italian style, done by hand: toLocaleString("it-IT")
-// silently returns ungrouped digits on runtimes without full ICU data
-// (seen: "1240" instead of "1.240"), and a counter that sometimes groups
-// and sometimes does not is worse than one that never does.
+// Thousand grouping, done by hand: toLocaleString silently returns ungrouped
+// digits on runtimes without full ICU data (seen: "1240" instead of "1,240"),
+// and a counter that sometimes groups and sometimes does not is worse than
+// one that never does.
 const grouped = (n: number) =>
-  String(Math.trunc(Math.abs(n))).replace(/\B(?=(\d{3})+(?!\d))/g, ".")
+  String(Math.trunc(Math.abs(n))).replace(/\B(?=(\d{3})+(?!\d))/g, ",")
 
 // The one line that answers both questions, with each clock attached to the
 // thing it measures:
@@ -177,31 +184,39 @@ const grouped = (n: number) =>
 // was filed — so the "current item" is the wing (known upfront, the plugin
 // mines wing by wing) plus the live drawer count. A negative delta (a
 // concurrent prune removed rows mid-run) is omitted rather than shown.
+//
+// The elapsed clock is mineStartedAt, set once when the run starts. The
+// status file's own `ts` is rewritten on every write (including the 2s
+// progress poll), so using it made the line flicker between "running for 1s"
+// and "running for 2s" forever.
 const summary = (s: Status, q: Queue) => {
   if (working(s)) {
-    const since = s.ts ? Date.parse(s.ts) : 0
+    const since = s.mineStartedAt ? Date.parse(s.mineStartedAt) : 0
     const wing =
-      typeof s.wingsTotal === "number" && s.wingsTotal > 1 ? ` · wing ${(s.wingIndex ?? 0) + 1} di ${s.wingsTotal}` : ""
+      typeof s.wingsTotal === "number" && s.wingsTotal > 0
+        ? ` · w${(s.wingIndex ?? 0) + 1}/${s.wingsTotal}`
+        : ""
+    const wait = s.waiting ? " · waiting for palace" : ""
     let grown = ""
     if (
       typeof s.drawersBaseline === "number" &&
       typeof s.drawersNow === "number" &&
       s.drawersNow - s.drawersBaseline >= 0
     ) {
-      grown = ` · +${grouped(s.drawersNow - s.drawersBaseline)} drawer`
+      grown = ` · +${grouped(s.drawersNow - s.drawersBaseline)} drawers`
     }
-    return `${q.count} in coda · avanza da ${since ? span(since) : "poco"}${wing}${grown}`
+    return `${q.count} queued · running for ${since ? span(since) : "just started"}${wing}${wait}${grown}`
   }
   if (q.count > 0) {
-    const age = q.oldest ? span(q.oldest) : "poco"
+    const age = q.oldest ? span(q.oldest) : "a while"
     // When the palace is held by another process the queue is not waiting
     // because nothing wants it: it is waiting because it cannot be written.
     // Saying so is the difference between a user who waits and a user who
     // goes and closes the thing holding the lock.
-    if (s.phase === "busy" || s.error) return `${q.count} in coda · bloccato da ${age} · palazzo occupato`
-    return `${q.count} in coda · in coda da ${age}`
+    if (s.phase === "busy" || s.error) return `${q.count} queued · blocked ${age} · palace busy`
+    return `${q.count} queued · waiting ${age}`
   }
-  return "coda vuota"
+  return "queue empty"
 }
 
 export default {
@@ -228,8 +243,9 @@ export default {
     // timer forever, which is exactly the "never stops moving" feel we dropped.
     let anim: ReturnType<typeof setInterval> | null = null
     const syncAnim = () => {
-      const p = status().phase
-      const want = p === "mining" || p === "busy"
+      // The sweep runs only while a mine is actually in flight. "busy" is
+      // terminal (the run gave up waiting), so nothing animates there.
+      const want = working(status())
       if (want && anim === null) anim = setInterval(() => setTick((t) => t + 1), 180)
       if (!want && anim !== null) {
         clearInterval(anim)
@@ -255,19 +271,20 @@ export default {
     }
 
     // The header word: the state of the WORK, not of the process. A queue
-    // held by another writer is "bloccato", which is a different problem with
+    // held by another writer is "blocked", which is a different problem with
     // a different fix than a queue nobody has got to yet. While mining, the
-    // wing counter says which slice of the run this is.
+    // wing counter says which slice of the run this is — always shown, even
+    // for a single wing, because "w1/1" confirms the run was scoped at all.
     const label = () => {
       const s = status()
       const q = queue()
       if (s.phase === "mining") {
-        if (typeof s.wingsTotal === "number" && s.wingsTotal > 1) {
-          return `mining · wing ${(s.wingIndex ?? 0) + 1} di ${s.wingsTotal}`
+        if (typeof s.wingsTotal === "number" && s.wingsTotal > 0) {
+          return `mining · w${(s.wingIndex ?? 0) + 1}/${s.wingsTotal}`
         }
         return PHASE_LABEL[s.phase] ?? s.phase
       }
-      if (q.count > 0) return s.phase === "busy" || s.error ? "bloccato" : "coda"
+      if (q.count > 0) return s.phase === "busy" || s.error ? "blocked" : "queue"
       return PHASE_LABEL[s.phase] ?? s.phase
     }
 
