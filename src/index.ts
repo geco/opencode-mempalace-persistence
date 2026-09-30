@@ -1077,6 +1077,7 @@ function exitSync(): void {
     if (wings.size === 0) return
     const deadline = Date.now() + EXIT_BUDGET_MS
     const done: string[] = []
+    let locked = false
     for (const [wing] of wings) {
       const remaining = deadline - Date.now()
       if (remaining <= 0) { log("exit save: budget exhausted, rest covered next startup"); break }
@@ -1100,8 +1101,23 @@ function exitSync(): void {
         maxBuffer: CHILD_MAX_BUFFER,
       })
       if (res.error || res.status !== 0) {
-        const why = (res.error as any)?.message || (res as any).signal || res.status
-        errLog(`exit mine err (${wing}): ${String(why)}`)
+        // The cause lives on stderr, not in the error object: the process ran
+        // and exited non-zero, so res.error is undefined and res.status is
+        // just the number. Logging the status produced 801 identical lines
+        // reading "exit mine err (wing): 1" — the real message was there all
+        // along, on stderr, and threw away. An error that does not report its
+        // cause is worse than no error.
+        const detail = String(res.stderr || "").trim()
+        const why = (res.error as any)?.message || detail || (res as any).signal || res.status
+        errLog(`exit mine err (${wing}): ${String(why).slice(0, 300)}`)
+        // A palace held by the MCP server is contention, not a failure, and it
+        // applies to every wing equally. Bailing out here meant one blocked
+        // wing abandoned all the others that could have drained. Skip this
+        // one and keep going, exactly as the in-session path does.
+        if (/is held by/i.test(String(why))) {
+          locked = true
+          continue
+        }
         return
       }
       commitExportedIds(new Map([[wing, exportedIds.get(wing) || new Map()]]))
@@ -1112,6 +1128,14 @@ function exitSync(): void {
       try { rmdirSync(join(OUT_DIR, wing)) } catch {}
     }
     try { rmdirSync(OUT_DIR) } catch {}
+    if (locked) {
+      // Say it once, in the status the TUI reads, so the footer can say WHY
+      // the queue is not draining instead of leaving the user to guess.
+      statusPhase = "busy"
+      statusError = "palazzo occupato da un altro processo"
+      writeStatus(true)
+      log("exit save: palace is held by another process — queue left for the in-session mine")
+    }
     log("exit save done")
   } catch (e) { errLog("exit save err: " + String(e)) }
 }

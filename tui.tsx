@@ -169,7 +169,15 @@ const summary = (s: Status, q: Queue) => {
     const since = s.ts ? Date.parse(s.ts) : 0
     return `${q.count} in coda · avanza da ${since ? span(since) : "poco"}`
   }
-  if (q.count > 0) return `${q.count} in coda · fermo da ${q.oldest ? span(q.oldest) : "poco"}`
+  if (q.count > 0) {
+    const age = q.oldest ? span(q.oldest) : "poco"
+    // When the palace is held by another process the queue is not waiting
+    // because nothing wants it: it is waiting because it cannot be written.
+    // Saying so is the difference between a user who waits and a user who
+    // goes and closes the thing holding the lock.
+    if (s.phase === "busy" || s.error) return `${q.count} in coda · bloccato da ${age} · palazzo occupato`
+    return `${q.count} in coda · in coda da ${age}`
+  }
   return "coda vuota"
 }
 
@@ -223,6 +231,17 @@ export default {
       return skin.success
     }
 
+    // The header word: the state of the WORK, not of the process. A queue
+    // held by another writer is "bloccato", which is a different problem with
+    // a different fix than a queue nobody has got to yet.
+    const label = () => {
+      const s = status()
+      const q = queue()
+      if (working(s)) return PHASE_LABEL[s.phase] ?? s.phase
+      if (q.count > 0) return s.phase === "busy" || s.error ? "bloccato" : "coda"
+      return PHASE_LABEL[s.phase] ?? s.phase
+    }
+
     // The bar itself: a gauge of the queue, lit only while a mine is running.
     const gaugeLine = () => {
       const n = queue().count
@@ -243,9 +262,7 @@ export default {
               <text fg={tone()}>
                 <span style={{ fg: tone() }}>◆</span> MemPalace
               </text>
-              <text fg={backlogged(s, q) ? skin.warning : skin.muted}>
-                {backlogged(s, q) ? "coda" : PHASE_LABEL[s.phase] ?? s.phase}
-              </text>
+              <text fg={backlogged(s, q) ? skin.warning : skin.muted}>{label()}</text>
             </box>
             <text fg={tone()}>{gaugeLine()}</text>
             <text fg={skin.muted}>{summary(s, q)}</text>
