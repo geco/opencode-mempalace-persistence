@@ -225,7 +225,31 @@ Every turn (question + answer) is saved as a drawer in MemPalace. Mining runs wi
 
 ### Message-level dedup
 
-Each opencode message is exported **exactly once ever**: exported message IDs are tracked in `sync_state.json` (retained 90 days / 200k entries) and skipped on later runs. This kills the main duplicate source mempalace's file-level dedup cannot catch — repeated boilerplate (e.g. system prompts re-sent every turn) landing in different export files. (`mempalace dedup` only compares drawers from the *same* source file, so it can't fix that either.)
+Each opencode message is exported **exactly once ever**. A message is skipped if its content is either already in the palace (`mined_ids` in `sync_state.json`, recorded when a mine succeeds) or still waiting in the queue. This kills the main duplicate source mempalace's file-level dedup cannot catch — repeated boilerplate (e.g. system prompts re-sent every turn) landing in different export files. (`mempalace dedup` only compares drawers from the *same* source file, so it can't fix that either.)
+
+The "still in the queue" half is **read back from the queue files themselves**, not remembered in the state file. Every export ends with a trailer:
+
+```
+<!-- mp-ids: msg_0f1b9…,msg_0f1ba…,msg_0f1bb… -->
+```
+
+so the plugin can rebuild the set of queued messages by reading the files. One trailer line per file, not an id per message inline, so the transcript itself stays verbatim.
+
+That choice is deliberate. The obvious alternative — keeping the same ids in `sync_state.json` — drifts the moment anything touches the queue outside the plugin (a manual cleanup, a disk purge, a run killed between write and bookkeeping). A stale set makes the plugin believe a message is queued when its file is gone, and that content is then never exported again: silent, permanent, with no error anywhere. Deriving the set from the files makes that impossible, and deleting a file by hand immediately frees its messages. Cost is one tail read per queued file, once per sync.
+
+A file with no trailer — anything written by 2.x — contributes nothing, which errs toward re-exporting (duplicate memory) rather than losing it.
+
+### Filenames are content-addressed
+
+```
+sync_<session-id-prefix>_<sha256-of-transcript[0:12]>.txt
+```
+
+The hash covers **only the transcript**, and the filename carries no date and no title. Both were volatile: the same window re-exported on a different day hashed differently and became a *new* file instead of overwriting the old one. That is how one session ended up as three near-identical files in the queue (116 sections, then 137, then 116 again — two of them byte-identical but for the date line).
+
+Nothing is lost by taking them out: title, session and date stay in the file header, and the date is named `Last verified:` because that is what it is — the last time the window was confirmed, rewritten on every re-export. Calling it `Date:` implied a creation date it never had.
+
+A filename has to be a function of the content, or deduplication cannot work at all. It also makes a *growing* window correct: new messages mean a new hash, so a new file, disjoint from the previous one by construction.
 
 ### The cursor means "exported", not "mined"
 
@@ -238,7 +262,17 @@ An earlier version advanced the cursor only after a successful mine. A mine that
 
 With the cursor on write, windows are always disjoint: the next export starts where the last one stopped. A failed mine loses nothing — **the pending file *is* the queue**, and the next mine picks it up untouched.
 
+The cursor also advances when a window turns out to be *entirely* already in the queue, even though no file was written. Without that, a wing whose window is fully covered would re-read the same messages on every sync forever and never write anything again.
+
+One clamp remains, and it is the residual cause of the 691-file blow-up: if a reply looks in-flight, the cursor is pulled back to just before it, so the next sync re-cuts that window. It is time-bounded (a reply with no new content for 30 minutes is treated as dead and exported as-is), which is why it only bites while something is actively streaming. Combined with content-addressed filenames and the queued-message filter, a re-cut window is now a no-op instead of a new pile of files.
+
 If the queue stops draining (mines blocked or too slow), `hook.log` gets a `WARNING: N exported files waiting to be mined` line, visible in `/memory-status`. Silence there is what hid the blow-up.
+
+### If you purge the palace by hand
+
+`mined_ids` is a claim about the palace: "this message's content was filed". Delete drawers manually — by `source_file`, by age, whatever — and that claim becomes false while the plugin still believes it, so those messages will not be exported again.
+
+After a manual purge, clear the affected entries from `mined_ids` in `~/.mempalace/sync_state.json`, or delete the whole file to rebuild from scratch (the cost is re-exporting and re-mining recent history, not data loss). Keeping the ids per message rather than per file is what makes a selective repair possible.
 
 ### Backfill existing sessions
 
@@ -316,7 +350,46 @@ The plugin exports everything in the opencode database on the next sync, then re
 | `~/.mempalace/config.json` | MemPalace config (palace path) |
 | `~/.mempalace/knowledge_graph.sqlite3` | Knowledge Graph (structured facts) |
 | `~/opencode-memory/` | MemPalace vector DB (all drawers) |
-| `~/.mempalace/sync_state.json` | Last sync state |
+| `~/.mempalace/sync_state.json` | Per-wing cursors + mined message IDs |
+| `~/.mempalace/hook_state/status.json` | One small JSON the TUI status line polls (phase, queue depth, last event) |
+
+---
+
+## Status line in the TUI (OpenCode v2)
+
+The plugin ships a second entry point, `tui.tsx`, that claims the sidebar footer:
+
+```
+◆ MemPalace  idle
+████████░░░░░░░░░░░░░░
+18 in coda · mine ok · 42 drawer  2m fa
+```
+
+What the bar shows is **queue depth, not progress** — one cell per pending file, capped at 24. It was a percentage at first and that was wrong: there is no real percentage to show (`mempalace mine` is a black box), so an animated 0→100 loop just read as a job stuck at 99%. A progress indicator that lies is the worst possible thing in a memory plugin. While a mine is actually running a `▓▓▓` window sweeps across the bar so activity is visible without inventing a number; idle, the bar is **completely still** and no timer is running.
+
+Two details cost real time to find, both from `packages/plugin/src/host.ts`:
+
+```ts
+const specifier = target.name
+  ? [target.name, subpath].filter(Boolean).join("/")   // package -> "name/tui"
+  : path.resolve(target.directory, subpath || "index") // local dir -> <dir>/tui
+```
+
+1. For a **package** (how this ships) the entry must be reachable as `<package-name>/tui`, i.e. declared in this package's `exports` map. For a **local directory** the file must be literally named `tui` — a plain `index.tsx` is never a TUI candidate. (This is also why `server.mjs` exists at the repo root: a local directory resolves its server entry as `<dir>/server` before `<dir>/index`.)
+2. **The TUI plugin filesystem is read-only.** A write is refused silently, which is why the direction is one-way: the server plugin publishes `status.json` and this side only polls it. It is also why a `console`/file trace from TUI code is useless for debugging.
+
+Local plugin directories load with `optional: true`, so an import error is skipped with no message anywhere. If a local TUI plugin does nothing, suspect the filename first: it must be `tui.tsx` / `tui.ts` / `tui.js` in a directory (or symlink to one) under `~/.config/opencode/plugins/`.
+
+`tui.tsx` is shipped **uncompiled** on purpose — OpenCode transpiles the TSX and provides the JSX factory, so `@opentui/solid` (14 MB with its Babel toolchain) is not a dependency. The only runtime import is `solid-js`, for the signals that drive the sweep.
+
+## Upgrades are not automatic
+
+OpenCode resolves npm plugins **once** and caches them. A new version of this plugin will not be picked up on its own. To upgrade:
+
+- the TUI's plugin update command, or
+- `rm -rf ~/.cache/opencode/npm/opencode-mempalace-persistence@latest` and restart.
+
+Check what is actually loaded with `opencode plugin list`.
 
 ---
 
