@@ -1,5 +1,5 @@
 import { execSync, execFileSync, execFile, spawnSync } from "child_process"
-import { existsSync, readFileSync, writeFileSync, mkdirSync, rmdirSync, unlinkSync, appendFileSync, statSync, readdirSync } from "fs"
+import { existsSync, readFileSync, writeFileSync, mkdirSync, rmdirSync, unlinkSync, appendFileSync, statSync, readdirSync, openSync, readSync, closeSync } from "fs"
 import { homedir } from "os"
 import { join, dirname } from "path"
 import { createHash } from "crypto"
@@ -63,7 +63,51 @@ function errLog(msg: string) {
 // Structured interaction log (JSON lines): every MemPalace question and
 // answer, readable by /memory-log. Ephemeral TUI toasts show the moment;
 // this file keeps the history — without polluting session context.
+// TUI status: one small JSON file the TUI-side plugin polls. Direction is
+// always server -> file, because the TUI plugin filesystem is READ-ONLY (a
+// write there is refused, silently, which makes a debug trace useless).
+// Kept separate from interactions.log on purpose: that file is a JSONL
+// archive that reaches hundreds of KB, and the TUI should not tail it.
+const STATUS_FILE = join(HOOK_STATE_DIR, "status.json")
+type StatusPhase = "idle" | "mining" | "busy" | "error"
+let statusPhase: StatusPhase = "idle"
+let statusWing = ""
+let statusLast: Record<string, unknown> | null = null
+let statusError = ""
+let statusWrittenAt = 0
+
+function writeStatus(force = false): void {
+  const now = Date.now()
+  // Throttled: ilog() fires on every tool call and this is only a UI hint.
+  if (!force && now - statusWrittenAt < 400) return
+  statusWrittenAt = now
+  try {
+    mkdirSync(HOOK_STATE_DIR, { recursive: true })
+    writeFileSync(
+      STATUS_FILE,
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        phase: statusPhase,
+        wing: statusWing || undefined,
+        pending: countPendingFiles(),
+        last: statusLast || undefined,
+        error: statusError || undefined,
+        plugin: `${pluginName()} v${pluginVersion()}`,
+      }),
+      { mode: 0o600 },
+    )
+  } catch (e) {
+    log("status write err: " + String(e))
+  }
+}
+
+function statusEvent(kind: string, data: Record<string, unknown> = {}): void {
+  statusLast = { kind, ...data, at: new Date().toISOString() }
+  writeStatus()
+}
+
 function ilog(kind: string, data: Record<string, unknown>): void {
+  statusEvent(kind, data)
   try {
     mkdirSync(HOOK_STATE_DIR, { recursive: true })
     appendFileSync(INTERACTIONS_LOG, JSON.stringify({ ts: new Date().toISOString(), kind, ...data }) + "\n")
@@ -439,9 +483,14 @@ function readSyncState(): SyncState {
   return { last_sync_ms: 0, wings: {}, mined_ids: {} }
 }
 
-// Message IDs already exported in a previous run. An ID older than every
-// cursor can never be selected again (queries use time_created > cursor),
-// so the set is pruned to stay small.
+// Message IDs whose content is already IN THE PALACE. Committed only when a
+// mine succeeds, so it is the one set that means "durable".
+//
+// Caveat worth knowing: it is a claim about the palace, and a manual purge
+// invalidates it — after deleting drawers by source_file the ids say "filed"
+// while the content is gone, and those messages will not be exported again
+// until their entries are cleared from sync_state.json. Recorded per message
+// id rather than per file so a purge can be repaired selectively.
 function loadMinedIds(): Map<string, number> {
   try {
     const raw = (readSyncState().mined_ids || {}) as Record<string, number>
@@ -449,6 +498,62 @@ function loadMinedIds(): Map<string, number> {
   } catch {
     return new Map()
   }
+}
+
+// Message IDs currently sitting in the export queue, rebuilt by reading the
+// queue files themselves.
+//
+// The obvious alternative — remembering the same ids in sync_state.json — is
+// what this replaced, and it is worse in a way that only shows up later: the
+// two drift the moment anything touches the queue outside the plugin (a manual
+// cleanup, a disk purge, a run killed between write and bookkeeping). A stale
+// set makes the plugin believe a message is queued when its file is gone, and
+// that content is then never exported again — silent and permanent, with no
+// error anywhere. Deriving the set from the files makes that impossible: the
+// queue is the only record, and deleting a file immediately frees its
+// messages.
+//
+// Cost is one tail read per queued file, once per sync. A file with no
+// trailer — anything written by an older version — contributes nothing, which
+// errs toward re-exporting (duplicate memory) rather than losing it.
+function queueMessageIds(): Set<string> {
+  const ids = new Set<string>()
+  const TAIL = 32 * 1024
+  const TRAILER = /\n?<!-- mp-ids: ([^>]*?) -->\s*$/
+  let wings: string[] = []
+  try {
+    wings = readdirSync(OUT_DIR, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => join(OUT_DIR, e.name))
+  } catch {
+    return ids
+  }
+  for (const wing of wings) {
+    let files: string[] = []
+    try {
+      files = readdirSync(wing).filter((n) => n.endsWith(".txt"))
+    } catch {
+      continue
+    }
+    for (const name of files) {
+      try {
+        const path = join(wing, name)
+        const size = statSync(path).size
+        const len = Math.min(size, TAIL)
+        const buf = Buffer.alloc(len)
+        const fd = openSync(path, "r")
+        try {
+          readSync(fd, buf, 0, len, size - len)
+        } finally {
+          closeSync(fd)
+        }
+        const m = TRAILER.exec(buf.toString("utf-8"))
+        if (!m) continue
+        for (const id of m[1].split(",")) if (id) ids.add(id)
+      } catch {}
+    }
+  }
+  return ids
 }
 
 function commitExportedIds(byWing: Map<string, Map<string, number>>): void {
@@ -541,15 +646,23 @@ print(json.dumps(rows))
   // as incomplete is revisited by the next sync (idle/exit/startup).
   let cursor = now
   const wings = new Map<string, string[]>()
-  // Already-mined IDs loaded ONCE per export (state file can be MBs).
+  // Message IDs already known to be in the palace, loaded ONCE per export
+  // (the state file can be MBs).
   const seen = loadMinedIds()
-  // Wings that actually received an export file in this run. The cursor
-  // advances for these and ONLY these, right here — see the cursor note
-  // below: the export cursor means "written", not "mined".
-  const writtenWings = new Set<string>()
-  // Message IDs written to export files, PER WING. Recorded only when
-  // that wing mines successfully — recording another wing's IDs early
-  // would skip its content forever on failure.
+  // Message IDs sitting in the queue RIGHT NOW, read from the queue files
+  // themselves. Together with `seen` this is the full "already exported"
+  // set: a message is skipped if its content is either in the palace or
+  // waiting in a file. See queueMessageIds() for why the second half is
+  // derived rather than remembered.
+  const queued = queueMessageIds()
+  // Wings whose window is fully accounted for in this run — either a file was
+  // written, or every message was already in the queue. The cursor advances
+  // for these and ONLY these, right here — see the cursor note below: the
+  // export cursor means "written", not "mined".
+  const coveredWings = new Set<string>()
+  // Message IDs written to export files, PER WING. Moved into mined_ids only
+  // when that wing mines successfully; until then the queue file is the
+  // record (same reason the cursor advances on write).
   const exportedByWing = new Map<string, Map<string, number>>()
   mkdirSync(OUT_DIR, { recursive: true, mode: 0o700 })
 
@@ -559,7 +672,6 @@ print(json.dumps(rows))
     const wing = (((directory as string) || "").split("/").filter(Boolean).pop() || "global")
       .replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 40) || "global"
     const label = (title || "").replace(/[^a-zA-Z0-9 _-]/g, "_") || (sessId || "").slice(0, 12)
-    const prefix = `${new Date().toISOString().slice(0, 10)}_${label.slice(0, 30)}_${(sessId || "").slice(0, 8)}`
     const wingSince = cursorFor(wing)
 
     const msgs = runPython(`
@@ -637,41 +749,83 @@ print(json.dumps({"texts": texts, "incomplete": incomplete}))
     try {
       const parsed = JSON.parse(msgs) as { texts: typeof msgList; incomplete: number[] }
       // Message-level dedup: each message is exported exactly once ever.
+      // "Once ever" means once into the palace OR once into a queue file —
+      // a message waiting in the queue is already on its way in, and
+      // re-writing it would only make the mine file the same memory twice.
       // Repeated boilerplate (system prompts re-sent every turn) across
       // overlapping windows was the main duplicate source mempalace's
       // file-level dedup cannot catch (different files, same paragraph).
-      msgList = (parsed.texts || []).filter((m) => m && m.mid && !seen.has(m.mid))
+      msgList = (parsed.texts || []).filter((m) => m && m.mid && !seen.has(m.mid) && !queued.has(m.mid))
       incompleteTs = parsed.incomplete || []
     } catch { continue }
     if (incompleteTs.length > 0) {
       cursor = Math.min(cursor, Math.min(...incompleteTs) - 1)
     }
-    if (msgList.length < 2 && incompleteTs.length === 0) continue
-
-    const lines: string[] = [
-      `# ${title || label}`,
-      `Date: ${new Date().toISOString().slice(0, 10)}`,
-      `Session: ${sessId}`,
-      "",
-    ]
-    for (const m of msgList) {
-      const ts = m.ts ? new Date(m.ts).toISOString().slice(11, 19) : ""
-      lines.push(`## ${m.role.toUpperCase()} \u2014 ${ts}`)
-      lines.push("")
-      lines.push(m.text)
-      lines.push("")
+    // Count distinct messages, not text blocks: one message can carry several
+    // blocks, and a "file" holding a single message repeated is not memory
+    // worth filing.
+    const distinct = new Set(msgList.map((m) => m.mid)).size
+    if (distinct === 0) {
+      // The whole window is already in the queue, so there is nothing to
+      // write — but the cursor MUST still move past it. Without this the wing
+      // would re-read the same window on every sync forever, and since the
+      // window never changes nothing would ever be written again.
+      if (incompleteTs.length === 0) coveredWings.add(wing)
+      continue
     }
+    if (distinct < 2 && incompleteTs.length === 0) continue
 
-    const content = lines.join("\n").trim()
-    if (!content) continue
+    // The transcript, and ONLY the transcript, is what identifies a file.
+    //
+    // Both volatile fields used to be part of it: the export date and the
+    // session title. They made the same window hash differently on a different
+    // day, so every re-export created a NEW file instead of overwriting the
+    // old one — which is how one session ended up as three near-identical
+    // files in the queue (seen: 116 sections, then 137, then 116 again).
+    //
+    // A filename has to be a function of the content or deduplication can
+    // never work. With this hash an unchanged re-export lands on the same path
+    // and overwrites it, and a window that gained messages becomes a new file
+    // whose messages are disjoint from the previous one (the cursor only moves
+    // forward), so mining both costs no duplicated content.
+    const transcript = msgList
+      .map((m) => {
+        const ts = m.ts ? new Date(m.ts).toISOString().slice(11, 19) : ""
+        return `## ${m.role.toUpperCase()} \u2014 ${ts}\n\n${m.text}`
+      })
+      .join("\n\n")
+    if (!transcript.trim()) continue
 
-    const contentHash = createHash("sha256").update(content).digest("hex").slice(0, 12)
+    // The header keeps title, session and date — no information is lost by
+    // taking it out of the hash — but the date is named for what it actually
+    // is: the last time this window was confirmed, rewritten on every
+    // re-export. Calling it "Date" implied a creation date it never had.
+    const ids = [...new Set(msgList.map((m) => m.mid).filter(Boolean))].sort()
+    const content = [
+      `# ${title || label}`,
+      `Session: ${sessId}`,
+      `Last verified: ${new Date().toISOString().slice(0, 10)}`,
+      "",
+      transcript,
+      "",
+      // The trailer is what makes the queue self-describing: the ids of the
+      // messages this file holds. queueMessageIds() reads it back so a
+      // re-export skips them, and a file deleted by hand immediately makes its
+      // messages exportable again — no bookkeeping to fall out of sync. It is
+      // one line per file, not one id per message inline, so the transcript
+      // itself stays verbatim.
+      `<!-- mp-ids: ${ids.join(",")} -->`,
+    ]
+      .join("\n")
+      .trim()
+
+    const contentHash = createHash("sha256").update(transcript).digest("hex").slice(0, 12)
     const wingDir = join(OUT_DIR, wing)
     mkdirSync(wingDir, { recursive: true, mode: 0o700 })
-    const fname = `sync_${prefix}_${contentHash}.txt`
+    const fname = `sync_${(sessId || "session").slice(0, 8)}_${contentHash}.txt`
     writeFileSync(join(wingDir, fname), content + "\n", { mode: 0o600 })
-    writtenWings.add(wing)
     if (!exportedByWing.has(wing)) exportedByWing.set(wing, new Map())
+    coveredWings.add(wing)
     const wingIds = exportedByWing.get(wing)!
     for (const m of msgList) {
       if (m && m.mid && typeof m.ts === "number") wingIds.set(m.mid, m.ts)
@@ -706,9 +860,9 @@ print(json.dumps({"texts": texts, "incomplete": incomplete}))
   //
   // `cursor` is the running minimum over in-flight replies, so this never
   // skips past a reply that was still streaming when we looked.
-  for (const wing of writtenWings) markSynced(cursor, wing)
-  if (writtenWings.size > 0) {
-    log(`cursors advanced on write: ${[...writtenWings].join(", ")} -> ${new Date(cursor).toISOString()}`)
+  for (const wing of coveredWings) markSynced(cursor, wing)
+  if (coveredWings.size > 0) {
+    log(`cursors advanced on write: ${[...coveredWings].join(", ")} -> ${new Date(cursor).toISOString()}`)
   }
 
   return { wings, now: cursor, exportedIds: exportedByWing }
@@ -794,6 +948,10 @@ function doDbSync(): void {
   if (wings.size === 0) return
 
   miningLock = true
+  statusPhase = "mining"
+  statusWing = [...wings.keys()].join(",")
+  statusError = ""
+  writeStatus(true)
   log(`mining ${wingCount(wings)} sessions across ${wings.size} wings`)
 
   const entries = [...wings.entries()]
@@ -855,17 +1013,28 @@ function doDbSync(): void {
         }
         miningLock = false
         if (/is held by/i.test(msg)) {
+          statusPhase = "busy"
+          statusWing = wing
+          statusEvent("mine", { outcome: "busy", wing })
           log(`mine skipped, palace busy (${wing}) after ${attempt} retries — next trigger will retry`)
           ilog("mine", { outcome: "busy", wing })
           return
         }
         errLog(`mine err (${wing}): ${msg}`)
+        statusPhase = "error"
+        statusWing = wing
+        statusError = msg.slice(0, 200)
+        writeStatus(true)
         toast("error", "MemPalace", `mine failed (${wing}): ${msg.slice(0, 120)}`)
         ilog("mine", { outcome: "error", wing, error: msg.slice(0, 200) })
         return
       }
       log(`mined wing ${wing} (${files.length} sessions)`)
       wingDrawers.set(wing, parseDrawers(stdout))
+      statusPhase = "idle"
+      statusWing = ""
+      statusError = ""
+      statusEvent("mine", { outcome: "ok", wing, drawers: wingDrawers.get(wing) || 0 })
       // The cursor already advanced when these files were written, so a
       // successful mine has no cursor work left to do — it only files the
       // content and releases the queue.
@@ -937,6 +1106,7 @@ function initRuntime(client: any): void {
   autoInject = isAutoInjectEnabled()
   identity = readIdentity()
   interval = saveInterval()
+  writeStatus(true)
   log(`loaded (autoInjectContext: ${autoInject}, saveInterval: ${interval})`)
 
   // Catch anything missed by a previous run (e.g. content skipped when
