@@ -21,13 +21,14 @@
  * provides the JSX factory, so `@opentui/solid` (14M) is NOT a dependency.
  * The only runtime import is solid-js, for the signals that drive the bar.
  */
-import { readFileSync } from "node:fs"
+import { readFileSync, readdirSync, statSync } from "node:fs"
 import { join } from "node:path"
 import { homedir } from "node:os"
 import { createSignal, onCleanup } from "solid-js"
 
 const HOME = homedir()
 const STATUS_FILE = join(HOME, ".mempalace/hook_state/status.json")
+const QUEUE_DIR = join(HOME, ".mempalace/oc-sessions")
 
 type Phase = "idle" | "mining" | "busy" | "error" | "unknown"
 type Status = {
@@ -47,6 +48,37 @@ const readStatus = (): Status => {
   } catch {
     return { phase: "unknown", pending: 0 }
   }
+}
+
+// The queue is counted here rather than read from status.json, because that
+// field is a snapshot taken when an event was last logged. The plugin writes it
+// BEFORE deleting a mined wing's files and never refreshes it afterwards, so
+// right after a mine finished the line kept showing the pre-mine count. The
+// directory is the truth; reading it costs one readdir per second.
+type Queue = { count: number; oldest: number }
+
+const readQueue = (): Queue => {
+  let count = 0
+  let oldest = 0
+  try {
+    for (const w of readdirSync(QUEUE_DIR, { withFileTypes: true })) {
+      if (!w.isDirectory()) continue
+      let entries: string[] = []
+      try {
+        entries = readdirSync(join(QUEUE_DIR, w.name)).filter((n) => n.endsWith(".txt"))
+      } catch {
+        continue
+      }
+      count += entries.length
+      for (const n of entries) {
+        try {
+          const m = statSync(join(QUEUE_DIR, w.name, n)).mtimeMs
+          if (m > 0 && (oldest === 0 || m < oldest)) oldest = m
+        } catch {}
+      }
+    }
+  } catch {}
+  return { count, oldest }
 }
 
 const ink = (map: any, name: string, fallback: string) => {
@@ -95,35 +127,22 @@ const sweep = (pending: number, step: number) => {
   return cells.join("")
 }
 
-const ago = (iso?: string) => {
-  if (!iso) return ""
-  const t = Date.parse(iso)
-  if (!t) return ""
-  const s = Math.max(0, Math.round((Date.now() - t) / 1000))
-  if (s < 60) return `${s}s fa`
-  if (s < 3600) return `${Math.round(s / 60)}m fa`
-  return `${Math.round(s / 3600)}h fa`
+// How long something has been going, as a short span. No "fa": the label
+// already says what is being measured ("avanza da", "fermo da"), and a second
+// clock in the same line was what made the previous version unreadable.
+const span = (ms: number) => {
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000))
+  if (s < 60) return `${s}s`
+  if (s < 3600) return `${Math.round(s / 60)}m`
+  return `${Math.round(s / 3600)}h`
 }
 
 // "idle" means no mine is running, NOT that there is nothing to do. A queue
 // waiting to be drained while the plugin sits idle is exactly the state that
 // needed surfacing, and reporting it as plain idle is what made a stuck
 // 16-file queue look healthy. Backlog is its own state, and it is not green.
-const backlogged = (s: Status) => s.phase === "idle" && s.pending > 0
-
-const describe = (s: Status) => {
-  const l = s.last
-  if (!l) return backlogged(s) ? "coda in attesa" : "nessuna attivita"
-  if (l.kind === "mine") {
-    if (l.outcome === "ok") return `mine ok · ${l.drawers ?? 0} drawer`
-    if (l.outcome === "busy") return "palace occupato, si ritenta"
-    return `mine ${l.outcome ?? "?"}`
-  }
-  if (l.kind === "checkpoint") return "checkpoint armato"
-  if (l.kind === "search") return "ricerca"
-  if (l.kind === "tool") return String(l.kind)
-  return String(l.kind)
-}
+const working = (s: Status) => s.phase === "mining" || s.phase === "busy"
+const backlogged = (s: Status, q: Queue) => !working(s) && q.count > 0
 
 const PHASE_LABEL: Record<Phase, string> = {
   idle: "idle",
@@ -131,6 +150,27 @@ const PHASE_LABEL: Record<Phase, string> = {
   busy: "palace occupato",
   error: "errore",
   unknown: "in attesa",
+}
+
+// The one line that answers both questions, with each clock attached to the
+// thing it measures:
+//
+//   mining  -> how long the current mine has been running
+//   backlog -> how long the oldest queued file has been waiting
+//   drained -> nothing to wait for
+//
+// No percentage: the mine CLI exposes no total to divide by, and an invented
+// one reads as a job stuck at 99%. No "last event" text either — it was the
+// third clock on the line, and it mixed "when something was logged" with
+// "when the status file was written", which is how "coda in attesa 11m fa"
+// came to look like it meant something it did not.
+const summary = (s: Status, q: Queue) => {
+  if (working(s)) {
+    const since = s.ts ? Date.parse(s.ts) : 0
+    return `${q.count} in coda · avanza da ${since ? span(since) : "poco"}`
+  }
+  if (q.count > 0) return `${q.count} in coda · fermo da ${q.oldest ? span(q.oldest) : "poco"}`
+  return "coda vuota"
 }
 
 export default {
@@ -141,11 +181,14 @@ export default {
     // Signals must be created inside setup(): at module scope there is no
     // Solid owner to attach them to and the slot can render nothing.
     const [status, setStatus] = createSignal<Status>(readStatus())
+    const [queue, setQueue] = createSignal<Queue>(readQueue())
     const [tick, setTick] = createSignal(0)
 
-    // status.json is one small file: poll it once a second.
+    // status.json is one small file, and the queue is one directory listing:
+    // poll both once a second.
     const poll = setInterval(() => {
       setStatus(readStatus())
+      setQueue(readQueue())
       syncAnim()
     }, 1000)
 
@@ -169,22 +212,21 @@ export default {
     })
 
     const tone = () => {
-      const p = status().phase
-      if (p === "error") return skin.error
-      if (p === "busy") return skin.warning
-      if (p === "mining") return skin.accent
-      if (p === "unknown") return skin.muted
+      const s = status()
+      if (s.phase === "error") return skin.error
+      if (s.phase === "busy") return skin.warning
+      if (s.phase === "mining") return skin.accent
+      if (s.phase === "unknown") return skin.muted
       // A drained queue is genuinely idle; a queue with work in it is not,
       // and must not be reported as if it were.
-      if (backlogged(status())) return skin.warning
+      if (backlogged(s, queue())) return skin.warning
       return skin.success
     }
 
-    // The line itself: a queue gauge, lit only while a mine is running.
+    // The bar itself: a gauge of the queue, lit only while a mine is running.
     const gaugeLine = () => {
-      const s = status()
-      const active = s.phase === "mining" || s.phase === "busy"
-      return active ? sweep(s.pending, tick()) : gauge(s.pending)
+      const n = queue().count
+      return working(status()) ? sweep(n, tick()) : gauge(n)
     }
 
     // One claim, one place: the sidebar footer. A compact mirror in the prompt
@@ -194,20 +236,19 @@ export default {
       append: "sidebar.footer",
       render: () => {
         const s = status()
+        const q = queue()
         return (
           <box flexDirection="column" gap={0} flexShrink={0}>
             <box flexDirection="row" gap={1}>
               <text fg={tone()}>
                 <span style={{ fg: tone() }}>◆</span> MemPalace
               </text>
-              <text fg={backlogged(s) ? skin.warning : skin.muted}>
-                {backlogged(s) ? "coda" : PHASE_LABEL[s.phase] ?? s.phase}
+              <text fg={backlogged(s, q) ? skin.warning : skin.muted}>
+                {backlogged(s, q) ? "coda" : PHASE_LABEL[s.phase] ?? s.phase}
               </text>
             </box>
             <text fg={tone()}>{gaugeLine()}</text>
-            <text fg={skin.muted}>
-              {s.pending} in coda · {describe(s)} {ago(s.last?.at || s.ts)}
-            </text>
+            <text fg={skin.muted}>{summary(s, q)}</text>
           </box>
         )
       },
