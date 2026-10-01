@@ -1613,6 +1613,167 @@ function recordDetached(spawned: DetachedMine[]): void {
   }
 }
 
+// Read a process cmdline as argv array, or null when unreadable (zombie,
+// other user, raced exit). Linux-only caller checks /proc first.
+function procArgv(pid: number): string[] | null {
+  try {
+    const raw = readFileSync(`/proc/${pid}/cmdline`, "utf-8")
+    const parts = raw.split("\0").filter((s) => s.length > 0)
+    return parts.length > 0 ? parts : null
+  } catch {
+    return null
+  }
+}
+
+// State letter from /proc/<pid>/stat ("R", "S", "Z", "T"…), null when
+// unreadable. Parsed after the LAST ")" because the comm field (2nd field)
+// may itself contain spaces and parentheses.
+function procState(pid: number): string | null {
+  try {
+    const st = readFileSync(`/proc/${pid}/stat`, "utf-8")
+    const end = st.lastIndexOf(")")
+    if (end < 0) return null
+    return st.slice(end + 1).trim().split(/\s+/)[0] || null
+  } catch {
+    return null
+  }
+}
+
+function procAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+  } catch (e: any) {
+    // EPERM means it EXISTS but belongs to another user: treating that as
+    // dead would make us conclude a live holder is gone and race it. ESRCH
+    // and anything else are genuinely not there.
+    if (e && (e as any).code === "EPERM") return true
+    return false
+  }
+  // A zombie has exited but nobody reaped it yet: kill(0) still succeeds,
+  // but there is nothing left to signal or wait for. Counting it as alive
+  // would add the full SIGTERM grace to every reap and then report the pid
+  // as "not killed".
+  if (procState(pid) === "Z") return false
+  return true
+}
+
+function procParent(pid: number): number | null {
+  try {
+    const st = readFileSync(`/proc/${pid}/stat`, "utf-8")
+    const end = st.lastIndexOf(")")
+    if (end < 0) return null
+    const ppid = parseInt(st.slice(end + 1).trim().split(/\s+/)[1], 10)
+    return Number.isFinite(ppid) ? ppid : null
+  } catch {
+    return null
+  }
+}
+
+// Terminate stale detached mines from previous sessions (see exitSync).
+//
+// Why: a detached mine outlives opencode by design, but on reopen it is
+// pure contention — the startup mine backs off behind work nobody watches
+// anymore, and the footer sits on "wait". Resume is idempotent
+// (chunk_total protocol), so killing loses nothing: the startup mine
+// refiles the remainder.
+//
+// Safety — ALL must hold, else the pid is skipped:
+// - Linux (/proc readable); elsewhere skip silently,
+// - not ourselves, not pid <= 1,
+// - cmdline contains OUR wrapper script path (mine-detached.sh): a bare
+//   `mempalace mine` could be the user's own manual run, so only the
+//   wrapper — which only exitSync ever spawns — is unambiguous,
+// - orphan (ppid 1 or dead parent): never touch a process attached to a
+//   live parent, which could belong to a session that is still shutting
+//   down. Wrapper-only + orphan-only is what keeps concurrent instances
+//   safe: live work is never ours to kill. An unreadable
+//   /proc/<pid>/stat counts as orphan: the worst case is killing a mine a
+//   dying instance had just spawned, which resume makes harmless, while
+//   skipping would leave exactly the contention we are here to remove.
+//
+// Kill order per wrapper: mine children first (else they orphan and keep
+// the lock), then the wrapper. SIGTERM, short grace, SIGKILL survivors.
+// Returns pids killed.
+function reapDetachedMines(): number[] {
+  const killed: number[] = []
+  let procDir: string[] = []
+  try {
+    if (!existsSync("/proc")) return killed
+    procDir = readdirSync("/proc")
+  } catch {
+    return killed
+  }
+  const me = process.pid
+  const isWrapper = (argv: string[]) => argv.some((a) => a.endsWith("/mine-detached.sh") || a === "mine-detached.sh")
+  const targets: number[] = []
+  for (const name of procDir) {
+    const pid = /^\d+$/.test(name) ? parseInt(name, 10) : -1
+    if (!(pid > 1) || pid === me) continue
+    const argv = procArgv(pid)
+    // Wrappers only: the script path is unambiguously ours. A bare
+    // `mempalace mine` with our queue dir could be the user's own manual
+    // run (or another live instance's attached mine mid-reparent), so it
+    // is left to lock arbitration instead of being killed.
+    if (!argv || !isWrapper(argv)) continue
+    const ppid = procParent(pid)
+    if (ppid !== null && ppid !== 1 && procAlive(ppid)) continue
+    targets.push(pid)
+  }
+  const killWait = (pid: number, ms: number) => {
+    // A pid that is already gone still counts as reaped: the list reports
+    // stale work we took responsibility for, and a wrapper whose mine child
+    // just died usually exits on its own microseconds before our SIGTERM —
+    // counting only successful signals would under-report exactly the common
+    // case.
+    if (!procAlive(pid)) {
+      killed.push(pid)
+      return
+    }
+    try {
+      process.kill(pid, "SIGTERM")
+    } catch {
+      if (!procAlive(pid)) killed.push(pid)
+      return
+    }
+    const deadline = Date.now() + ms
+    while (Date.now() < deadline) {
+      if (!procAlive(pid)) break
+      try {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100)
+      } catch {
+        break
+      }
+    }
+    if (procAlive(pid)) {
+      try {
+        process.kill(pid, "SIGKILL")
+      } catch {}
+    }
+    if (!procAlive(pid)) killed.push(pid)
+  }
+  // Children before parents: find python mine processes whose parent is a
+  // targeted wrapper, kill those first so none orphan holding the lock.
+  // (Killing a wrapper that is between retries can leave its `sleep 60`
+  // orphaned instead — harmless: it holds no lock and self-terminates.)
+  const childrenOf = (ppid: number): number[] => {
+    const out: number[] = []
+    for (const name of procDir) {
+      const pid = /^\d+$/.test(name) ? parseInt(name, 10) : -1
+      if (!(pid > 1) || pid === me) continue
+      if (procParent(pid) === ppid) out.push(pid)
+    }
+    return out
+  }
+  for (const pid of targets) {
+    const argv = procArgv(pid)
+    if (argv && isWrapper(argv)) {
+      for (const child of childrenOf(pid)) killWait(child, 2000)
+    }
+    killWait(pid, 1000)
+  }
+  return killed
+}
+
 function exitSync(): void {
   try {
     const bin = resolveBin()
@@ -1713,34 +1874,36 @@ function initRuntime(client: any): void {
   writeStatus(true)
   log(`loaded (autoInjectContext: ${autoInject}, saveInterval: ${interval})`)
 
-  // Catch anything missed by a previous run (e.g. content skipped when
-  // the exit budget ran out). Fires once per server lifetime.
-  setTimeout(() => dbSync(), 10000)
-
-  // A detached mine from a previous session may still be running (it
-  // outlives opencode by design). Report it rather than colliding blindly:
-  // the startup mine above will meet "held by" and interleave via retry,
-  // which is the correct behavior — this line just says why the first
-  // attempt waits.
+  // Reap detached mines left by previous sessions BEFORE scheduling our own
+  // work. A detached mine outlives opencode by design (see exitSync), but on
+  // reopen it is pure contention: nobody is watching it, it holds the palace
+  // lock, and the footer sits on "wait" behind work with no owner. Killing it
+  // loses nothing — resume is idempotent by mempalace's chunk_total protocol,
+  // so our own mine refiles the remainder.
+  //
+  // Only orphaned wrappers of ours are touched (reapDetachedMines checks
+  // /proc cmdline + ppid), never another live instance's attached mine and
+  // never a manual `mempalace mine`. Anything it declines to kill stays
+  // arbitrated by the lock, as before.
   try {
-    const raw = JSON.parse(readFileSync(DETACHED_FILE, "utf-8"))
-    if (Array.isArray(raw)) {
-      const alive = raw.filter((e) => {
-        try {
-          process.kill(e.pid, 0)
-          return true
-        } catch {
-          return false
-        }
-      })
-      for (const e of alive) {
-        log(`detached mine from previous session still running (pid ${e.pid}, wings ${(e.wings || []).join(",")}) — startup mine will interleave via retry`)
-      }
-      if (alive.length !== raw.length) {
-        writeFileSync(DETACHED_FILE, JSON.stringify(alive.slice(-20)), { mode: 0o600 })
-      }
+    const killed = reapDetachedMines()
+    if (killed.length > 0) {
+      log(`reaped ${killed.length} detached mine process(es) from a previous session: ${killed.join(",")} — startup mine takes over (resume is idempotent)`)
+      ilog("mine", { outcome: "reaped", pids: killed })
     }
+  } catch (e) {
+    log("reap detached mines err: " + String(e).slice(0, 160))
+  }
+  // The pid file is stale after a reap: nothing in it survived on purpose.
+  try {
+    writeFileSync(DETACHED_FILE, JSON.stringify([]), { mode: 0o600 })
   } catch {}
+
+  // Catch anything missed by a previous run (e.g. content skipped when
+  // the exit budget ran out). Fires once per server lifetime. Delayed 10s so
+  // the reap above (which can wait a couple of seconds on SIGTERM grace)
+  // finishes first and the startup mine finds the lock free.
+  setTimeout(() => dbSync(), 10000)
 
   // Startup toast (delayed so the TUI is attached): shows exactly which
   // plugin build is loaded — no more guessing npm-cache vs local build —

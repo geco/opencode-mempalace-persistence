@@ -396,7 +396,24 @@ Closing opencode never stops the memory system. On exit the plugin exports what'
 
 Resume is duplicate-free by mempalace's own protocol, not by plugin bookkeeping: every drawer carries its `source_file` plus the file's `chunk_total`, so a mine tells a complete file from one that crashed mid-file (mempalace #2183), purges stale partial drawers, and refiles only what's missing — and drawer ids are deterministic on content, so even a full re-mine overwrites rather than duplicates. Reboot or `kill -9` at any point converges on the next mine. Lock contention at close is expected — MCP servers die with opencode but take seconds to release — so the detached mine goes through `mine-detached.sh`, which retries "held by" for up to 30 minutes and exits immediately on any other failure.
 
-Detached runs are recorded in `~/.mempalace/hook_state/detached-mines.json` (pid, wings, log) with per-wing logs `mine-<wing>-<ts>.log` pruned after 7 days; the next startup reports a still-running predecessor and interleaves via retry.
+Detached runs are recorded in `~/.mempalace/hook_state/detached-mines.json` (pid, wings, log) with per-wing logs `mine-<wing>-<ts>.log` pruned after 7 days.
+
+### Reopening opencode kills its own abandoned detached mines
+
+A detached mine that outlives its session is a feature; one that outlives a session the user has *replaced* is just contention — nobody is watching it, it holds the palace lock, and the new session's mine backs off behind work with no owner. So on startup the plugin reaps its own orphans before doing anything else (`reapDetachedMines`), and the mine it starts next owns the lock.
+
+Nothing is lost: resume is idempotent, so the new mine refiles whatever the old one had not finished.
+
+The reap is deliberately narrow, because "kill processes" is not ours to do at large. A pid is only signalled when **all** of these hold:
+
+- `/proc` is readable (Linux only — elsewhere the reap is a silent no-op and lock arbitration handles it as before),
+- it is not us and not pid ≤ 1,
+- its command line contains **our** `mine-detached.sh` wrapper — the only unambiguous signature. A bare `mempalace mine … ~/.mempalace/oc-sessions/...` could be your own manual run or another live session's attached mine, so it is left alone and arbitrated by the lock,
+- it is an **orphan** (ppid 1, or a parent that is already dead). A process attached to a live parent may belong to a session that is merely shutting down.
+
+Its children (the python mine holding the flock) are killed before the wrapper, so none is left orphaned with the lock. `SIGTERM`, ~2s grace, `SIGKILL` for survivors; an unreadable `/proc/<pid>/stat` counts as orphan, since the worst case there is killing work a dying session had just started — which idempotent resume makes harmless, while skipping would leave the contention in place. Everything killed is logged (`reaped N detached mine process(es)…`) and visible in `/memory-log`.
+
+`test-reap-detached.mjs` exercises this against real processes, extracting the functions from the compiled `dist/index.js` so the test cannot drift from what ships: orphan wrapper and its child killed, live-parented wrapper spared, a manual mine spared, unrelated orphans spared, pid 1 and self never signalled.
 
 Two details cost real time to find, both from `packages/plugin/src/host.ts`:
 
