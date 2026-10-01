@@ -146,7 +146,7 @@ const backlogged = (s: Status, q: Queue) => !working(s) && q.count > 0
 // Third row, above the two permanent lines, in two forms that never
 // coexist. While a read runs: ◇ MP searching "asdfasdf asdf .."
 // (hollow diamond: transient question, not a condition). Otherwise, if any
-// read completed this session: MP last search: 2m ago (5 results)
+// read completed this session: ◇ MP last search: 2m ago (5 res)
 // (muted: history, not activity; no text — the in-flight line had it).
 //   ◇        hollow diamond: same family as the ◆ semaphore, hollow because
 //            this state is transient (a question, not a condition)
@@ -171,8 +171,8 @@ const queryLine = (qq: { tool: string; text: string }): string => {
 const lastQueryLine = (lq: { tool: string; at: string; count: number | null }): string => {
   const at = lq.at ? Date.parse(lq.at) : 0
   const age = at ? ` ${span(at)} ago` : ""
-  const n = typeof lq.count === "number" && lq.count >= 0 ? ` (${lq.count} results)` : ""
-  return `MP last ${lq.tool}:${age}${n}`
+  const n = typeof lq.count === "number" && lq.count >= 0 ? ` (${lq.count} res)` : ""
+  return `◇ MP last ${lq.tool}:${age}${n}`
 }
 
 // Thousand grouping, done by hand: toLocaleString silently returns ungrouped

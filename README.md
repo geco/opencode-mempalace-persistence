@@ -379,7 +379,7 @@ A third line appears above them, only while a palace read is in flight:
 With no query running, the same row shows the last completed read, if any (muted: history, not activity):
 
 ```
-MP last search: 2m ago (5 results)
+◇ MP last search: 2m ago (5 res)
 ```
 
 Tool, age and result count (parsed from the result's `results` array; omitted when unparseable rather than invented). Session-scoped, not persisted: after a restart there is no last search until the first one.
