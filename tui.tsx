@@ -54,6 +54,7 @@ type Status = {
   fileTotal?: number | null
   lastRun?: { wings: number; files: number; drawers: number; at: string }
   querying?: { tool: string; text: string; startedAt?: string }
+  lastQuery?: { tool: string; text: string | null; at: string; count: number | null }
 }
 
 const readStatus = (): Status => {
@@ -142,8 +143,11 @@ const span = (ms: number) => {
 const working = (s: Status) => s.phase === "mining"
 const backlogged = (s: Status, q: Queue) => !working(s) && q.count > 0
 
-// Third line, rendered ONLY while a query is in flight, above the two
-// permanent lines. Format: ◇ MP searching "asdfasdf asdf .."
+// Third row, above the two permanent lines, in two forms that never
+// coexist. While a read runs: ◇ MP searching "asdfasdf asdf .."
+// (hollow diamond: transient question, not a condition). Otherwise, if any
+// read completed this session: MP last search: 2m ago (5 risultati)
+// (muted: history, not activity; no text — the in-flight line had it).
 //   ◇        hollow diamond: same family as the ◆ semaphore, hollow because
 //            this state is transient (a question, not a condition)
 //   18       max query chars, so the whole line stays within ~37 columns
@@ -158,6 +162,17 @@ const queryLine = (qq: { tool: string; text: string }): string => {
   const clean = qq.text.replace(/\s+/g, " ").trim()
   const shown = clean.length > QUERY_MAX ? clean.slice(0, QUERY_MAX) + ".." : clean
   return `◇ MP searching "${shown}"`
+}
+
+// Idle form of the same row: the last completed read, if any. Same row
+// position as the in-flight line (they never coexist), muted instead of
+// accent: history, not activity. No text shown — the in-flight line already
+// had it; here only tool, age and result count.
+const lastQueryLine = (lq: { tool: string; at: string; count: number | null }): string => {
+  const at = lq.at ? Date.parse(lq.at) : 0
+  const age = at ? ` ${span(at)} ago` : ""
+  const n = typeof lq.count === "number" && lq.count >= 0 ? ` (${lq.count} risultati)` : ""
+  return `MP last ${lq.tool}:${age}${n}`
 }
 
 // Thousand grouping, done by hand: toLocaleString silently returns ungrouped
@@ -237,7 +252,7 @@ const line1 = (s: Status, q: Queue): string => {
         : ""
     const wing =
       typeof s.wingsTotal === "number" && s.wingsTotal > 0 ? ` w${(s.wingIndex ?? 0) + 1}/${s.wingsTotal}` : ""
-    const wait = s.waiting ? " waiting" : ""
+    const wait = s.waiting ? " wait" : ""
     let grown = ""
     if (
       typeof s.drawersBaseline === "number" &&
@@ -246,7 +261,7 @@ const line1 = (s: Status, q: Queue): string => {
     ) {
       grown = ` +${grouped(s.drawersNow - s.drawersBaseline)}d`
     }
-    return `◆ MP mining${file} q${q.count}${wing} for ${since ? span(since) : "just started"}${wait}${grown}`
+    return `◆ MP mining${file} q${q.count}${wing} ${since ? span(since) : "just started"}${wait}${grown}`
   }
   if (q.count > 0) {
     const age = q.oldest ? span(q.oldest) : "a while"
@@ -321,8 +336,10 @@ export default {
     // One claim, one place: the sidebar footer. A compact mirror in the prompt
     // footer was tried and removed — two bars showing the same state read as
     // noise, and the prompt line is the most visually loaded area of the TUI.
-    // Two permanent lines (status tokens, progress bar) plus the transient
-    // query line above them, rendered only while a search is in flight.
+    // Two permanent lines (status tokens, progress bar) plus the query row
+    // above them: the in-flight search while one runs, else the last
+    // completed one if any, else nothing. The two query forms never
+    // coexist — clearing on completion guarantees it.
     const off = ctx.ui.slot({
       append: "sidebar.footer",
       render: () => {
@@ -330,7 +347,11 @@ export default {
         const q = queue()
         return (
           <box flexDirection="column" gap={0} flexShrink={0}>
-            {s.querying && <text fg={skin.accent}>{queryLine(s.querying)}</text>}
+            {s.querying ? (
+              <text fg={skin.accent}>{queryLine(s.querying)}</text>
+            ) : s.lastQuery ? (
+              <text fg={skin.muted}>{lastQueryLine(s.lastQuery)}</text>
+            ) : null}
             <text fg={tone()}>{line1(s, q)}</text>
             <text fg={tone()}>{barLine(s, tick())}</text>
           </box>

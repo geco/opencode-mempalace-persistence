@@ -103,6 +103,7 @@ function writeStatus(force = false): void {
         mineStartedAt: mineStartedAt || undefined,
         waiting: mineWaiting || undefined,
         querying: statusQuery || undefined,
+        lastQuery: statusLastQuery || undefined,
         fileIndex: mineFilesTotal > 0 ? mineFileIndex : undefined,
         filesTotal: mineFilesTotal > 0 ? mineFilesTotal : undefined,
         fileName: mineFileName || undefined,
@@ -692,11 +693,61 @@ const READ_TOOLS = new Set([
 
 function readQueryText(name: string, input: any): string | null {
   if (!READ_TOOLS.has(name)) return null
+  return pickText(input)
+}
+
+function pickText(input: any): string | null {
   const args = input?.args ?? input ?? {}
   const raw = args.query ?? args.text ?? args.entity ?? args.question ?? args.content ?? null
   if (typeof raw !== "string") return null
   const clean = raw.replace(/\s+/g, " ").trim()
   return clean ? clean.slice(0, 200) : null
+}
+
+// How many results a completed read returned, for the idle "last search"
+// row. The search result is JSON with a `results` array — either directly
+// or inside MCP content blocks. Anything else (errors, shapes without a
+// results list) yields null and the count is omitted rather than invented.
+function resultCount(out: unknown): number | null {
+  try {
+    let o: any = out
+    if (typeof o === "string") {
+      try {
+        o = JSON.parse(o)
+      } catch {
+        return null
+      }
+    } else if (o && typeof o === "object" && Array.isArray((o as any).content)) {
+      const texts = (o.content as any[])
+        .filter((b) => b?.type === "text" && typeof b?.text === "string")
+        .map((b) => b.text as string)
+      if (texts.length === 0) return null
+      try {
+        o = JSON.parse(texts.join("\n"))
+      } catch {
+        return null
+      }
+    }
+    if (o && Array.isArray(o.results)) return o.results.length
+    return null
+  } catch {
+    return null
+  }
+}
+
+// Last completed read, for the idle query row. Session-scoped module state
+// (NOT persisted): after a restart there is simply no "last search" until
+// the first one — unlike lastRun, which reassures across boots.
+let statusLastQuery: { tool: string; text: string | null; at: string; count: number | null } | null = null
+
+function noteQueryDone(rawName: string, argsLike: unknown, out: unknown): void {
+  try {
+    if (!isMemPalaceTool(rawName)) return
+    const name = shortToolName(rawName)
+    if (!READ_TOOLS.has(name)) return
+    statusLastQuery = { tool: name, text: pickText(argsLike), at: new Date().toISOString(), count: resultCount(out) }
+    writeStatus(true)
+  } catch {}
 }
 
 // A query currently in flight, if any. Set by execute.before, cleared by
@@ -1825,6 +1876,7 @@ async function server({ client }: any): Promise<any> {
           statusQuery = null
           writeStatus(true)
         }
+        noteQueryDone(name, (input as any)?.args, output)
         const summary = summarizeToolCall(name, (input as any)?.args, output)
         log(`tool: ${summary}`)
         toast("info", "MemPalace", summary)
@@ -1964,6 +2016,7 @@ const mempalaceV2 = PluginV2.define({
         const out = event?.status === "completed"
           ? event?.result
           : { output: String(event?.error?.message || event?.error || "") }
+        noteQueryDone(name, event?.input, out)
         const summary = summarizeToolCall(name, event?.input, out)
         log(`tool: ${summary}`)
         toast("info", "MemPalace", summary)

@@ -376,6 +376,14 @@ A third line appears above them, only while a palace read is in flight:
 
 `◇` hollow diamond (same family as `◆`, hollow because transient), query text capped at 18 chars so the line stays within ~37 columns and never wraps (`..` inside the quotes, only when truncated). Driven by `execute.before`/`after` hooks around an explicit read-tool allowlist (`search`, `diary_read`, `kg_query`, …); writes are excluded on purpose (recording is not querying). The footer polls every second, so sub-second queries rarely render mid-flight — multi-second searches do. Mining keeps priority: a query never replaces the mining line.
 
+With no query running, the same row shows the last completed read, if any (muted: history, not activity):
+
+```
+MP last search: 2m ago (5 risultati)
+```
+
+Tool, age and result count (parsed from the result's `results` array; omitted when unparseable rather than invented). Session-scoped, not persisted: after a restart there is no last search until the first one.
+
 Line 2 is a REAL fraction — completed files over total files of the run, queued arrivals included — not a gauge. What the bar shows is **queue depth, not progress** is over: the old gauge filled with the queue and could never drain visually. A percentage was tried first and was wrong (`mempalace mine` is a black box: no total to divide by, so an animated 0→100 loop read as a job stuck at 99%). A fraction of files is exact; a percentage of "done" would be invented. The `▓▓▓` window sweeps while mining so a slow batch (minutes between commits) still looks alive. Idle the bar always sits empty — even with nothing queued, where a full bar read as garish: "done" is said by the idle line (last run summary below), and the accent-colored fill is then unmistakably the "executing" state.
 
 Per-FILE completion does not come from the mine: the miner walks the files silently (`for i, filepath in enumerate(files, 1)` — it knows, it just never says) and only the final summary reports. It comes from the palace instead: every filed drawer records its `source_file` plus the file's `chunk_total`, so intersecting the wing directory with the filed set tells exactly which files are done — with zero mine overhead. A read-only `COUNT(*)` plus one grouped metadata query, polled every 3s while a mine runs. Anything unreadable degrades to elapsed-time-only.
