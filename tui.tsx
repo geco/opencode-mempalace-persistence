@@ -237,7 +237,7 @@ const line1 = (s: Status, q: Queue): string => {
         : ""
     const wing =
       typeof s.wingsTotal === "number" && s.wingsTotal > 0 ? ` w${(s.wingIndex ?? 0) + 1}/${s.wingsTotal}` : ""
-    const wait = s.waiting ? " waiting for palace" : ""
+    const wait = s.waiting ? " waiting" : ""
     let grown = ""
     if (
       typeof s.drawersBaseline === "number" &&

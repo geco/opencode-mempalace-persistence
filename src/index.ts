@@ -1483,9 +1483,10 @@ function doDbSync(): void {
 // so every exit produced an ETIMEDOUT and the queue never drained). The
 // detached child outlives us and keeps filing; nothing is deleted or
 // committed here. The next startup's mine re-scans, skips filed-and-unchanged
-// files in seconds, and only then deletes files and records ids. A second
-// close while one is still running exits immediately on the lock ("held by")
-// and is logged, not an error: the first one is already doing the work.
+// files in seconds, and only then deletes files and records ids. Lock
+// contention at close is handled by mine-detached.sh, which retries
+// "held by" for up to 30 minutes (MCP servers die with opencode but take
+// seconds to release the lock).
 //
 // Resume is duplicate-free by mempalace's own protocol, not by our
 // bookkeeping: every drawer carries its source_file plus the file's
@@ -1568,27 +1569,39 @@ function exitSync(): void {
     } catch {}
     const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)
     const spawned: DetachedMine[] = []
+    // Package root (this file runs as dist/index.js): the wrapper ships
+    // beside it and is listed in package.json "files".
+    let wrapper = ""
+    try {
+      const root = dirname(fileURLToPath(import.meta.url))
+      const cand = join(root, "..", "mine-detached.sh")
+      if (existsSync(cand)) wrapper = cand
+    } catch {}
+    try {
+      mkdirSync(HOOK_STATE_DIR, { recursive: true })
+      pruneMineLogs()
+    } catch {}
     for (const wing of pending) {
       const logPath = join(HOOK_STATE_DIR, `mine-${wing}-${stamp}.log`)
-      let fd: number | null = null
       try {
-        mkdirSync(HOOK_STATE_DIR, { recursive: true })
-        pruneMineLogs()
-        fd = openSync(logPath, "a", 0o600)
-      } catch {
-        fd = null
-      }
-      try {
-        const child = spawn(bin, mineArgs(join(OUT_DIR, wing), wing), {
+        // The wrapper retries "held by" for up to 30 minutes: at close time
+        // the lock is often still held — MCP servers die with opencode but
+        // take seconds to release, and a second instance may hold it longer.
+        // A bare mine would exit on the first refusal and the backlog would
+        // wait for the next startup. Any other failure exits immediately.
+        const argv = wrapper
+          ? [wrapper, bin, logPath, ...mineArgs(join(OUT_DIR, wing), wing)]
+          : [bin, ...mineArgs(join(OUT_DIR, wing), wing)]
+        const child = spawn(argv[0], argv.slice(1), {
           detached: true,
-          stdio: fd !== null ? ["ignore", fd, fd] : "ignore",
+          stdio: "ignore",
         })
-        // The parent's copy of fd closes with us; the child's stays open.
         // unref lets our exit proceed without waiting — the child is adopted
         // by init and keeps running (verified: parent death, child alive,
         // log written to completion).
         child.unref()
-        if (child.pid) spawned.push({ pid: child.pid, startedAt: new Date().toISOString(), wings: [wing], log: logPath })
+        if (child.pid)
+          spawned.push({ pid: child.pid, startedAt: new Date().toISOString(), wings: [wing], log: logPath })
         log(`exit save: detached mine for wing ${wing} (pid ${child.pid ?? "?"}) — continues after exit`)
       } catch (e) {
         errLog(`exit save: cannot detach mine (${wing}): ${String(e).slice(0, 160)}`)
