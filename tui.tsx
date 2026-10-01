@@ -217,7 +217,7 @@ const line1 = (s: Status, q: Queue): string => {
       typeof s.drawersNow === "number" &&
       s.drawersNow - s.drawersBaseline >= 0
     ) {
-      grown = ` +${grouped(s.drawersNow - s.drawersBaseline)}`
+      grown = ` +${grouped(s.drawersNow - s.drawersBaseline)}d`
     }
     return `◆ MP mining${file} q${q.count}${wing} for ${since ? span(since) : "just started"}${wait}${grown}`
   }
@@ -232,7 +232,7 @@ const line1 = (s: Status, q: Queue): string => {
   const last = s.lastRun
   if (last && last.files > 0) {
     const at = last.at ? Date.parse(last.at) : 0
-    return `◆ MP idle ${last.files}f ${last.wings}w${at ? ` ${span(at)} ago` : ""} (+${grouped(last.drawers)} drawers)`
+    return `◆ MP idle ${last.files}f ${last.wings}w${at ? ` ${span(at)} ago` : ""} (+${grouped(last.drawers)}d)`
   }
   return "◆ MP idle"
 }

@@ -1367,6 +1367,23 @@ function doDbSync(): void {
         return
       }
       log(`mined wing ${wing}`)
+      // Keep the miner's own summary: "Drawers filed: 0" with no reason is
+      // unanswerable after the fact (seen live), while the tail shows skips
+      // and counts. Same per-wing log files as detached mines, same 7d prune.
+      try {
+        mkdirSync(HOOK_STATE_DIR, { recursive: true })
+        pruneMineLogs()
+        const tail = String(stdout || "")
+          .trim()
+          .split("\n")
+          .slice(-30)
+          .join("\n")
+        appendFileSync(
+          join(HOOK_STATE_DIR, `mine-${wing}-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}.log`),
+          tail + "\n",
+          { mode: 0o600 },
+        )
+      } catch {}
       wingDrawers.set(wing, parseDrawers(stdout))
       statusPhase = "idle"
       statusWing = ""
