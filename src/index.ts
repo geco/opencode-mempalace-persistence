@@ -1,5 +1,6 @@
-import { execSync, execFileSync, execFile, spawnSync } from "child_process"
-import { existsSync, readFileSync, writeFileSync, mkdirSync, rmdirSync, unlinkSync, appendFileSync, statSync, readdirSync, openSync, readSync, closeSync } from "fs"
+import { execSync, execFileSync, execFile, spawn } from "child_process"
+import type { ChildProcess } from "child_process"
+import { existsSync, readFileSync, writeFileSync, mkdirSync, rmdirSync, unlinkSync, appendFileSync, statSync, readdirSync, openSync, readSync, closeSync, realpathSync } from "fs"
 import { homedir } from "os"
 import { join, dirname } from "path"
 import { createHash } from "crypto"
@@ -99,6 +100,11 @@ function writeStatus(force = false): void {
         drawersNow: mineDrawersNow >= 0 ? mineDrawersNow : undefined,
         mineStartedAt: mineStartedAt || undefined,
         waiting: mineWaiting || undefined,
+        fileIndex: mineFilesTotal > 0 ? mineFileIndex : undefined,
+        filesTotal: mineFilesTotal > 0 ? mineFilesTotal : undefined,
+        fileName: mineFileName || undefined,
+        fileFiled: mineFileFiled >= 0 ? mineFileFiled : undefined,
+        fileTotal: mineFileTotal != null ? mineFileTotal : undefined,
       }),
       { mode: 0o600 },
     )
@@ -129,6 +135,17 @@ let mineWingsTotal = 0
 let mineDrawersBaseline = -1
 let mineDrawersNow = -1
 let minePoll: ReturnType<typeof setInterval> | null = null
+// Wing names of THIS run, in mining order. The mine covers every wing with
+// pending files (fresh exports plus stale leftovers), not just the fresh
+// ones — see the union below.
+let mineWingNames: string[] = []
+// Per-file progress of the CURRENT wing. See pollMineProgress for why this
+// is read from the palace instead of the mine.
+let mineFileIndex = 0
+let mineFilesTotal = 0
+let mineFileName = ""
+let mineFileFiled = -1
+let mineFileTotal: number | null = null
 // When THIS run started, as an ISO string. status.json's `ts` is rewritten
 // on every status write (including the 2s progress poll and every tool-call
 // event), so it measures "time since the last write" — which is what made
@@ -141,23 +158,113 @@ let mineStartedAt: string | null = null
 let mineWaiting = false
 
 function palaceDrawersNow(): number {
+  return queryFiled([]).drawers
+}
+
+// Filed-set for exact per-file progress, read from the palace.
+//
+// Every filed drawer carries its source_file plus the file's chunk_total,
+// so intersecting the wing directory with the filed set tells exactly which
+// files are done and where the current one stands — with zero mine overhead.
+// (This is what made per-file mine invocations unnecessary: the detail is
+// free, the +56s/file startup cost is not paid. A file is complete when its
+// filed drawers reach its chunk_total; mempalace records both per drawer
+// precisely so a crashed mid-file mine can be told apart from a complete
+// one — see #2183.)
+//
+// One python call returns the palace-wide drawer count plus the per-file
+// tallies for the given paths. Anything unreadable degrades to -1/empty and
+// the footer falls back to elapsed-time-only.
+function queryFiled(dbPaths: string[]): {
+  drawers: number
+  files: Record<string, { n: number; total: number | null }>
+} {
+  const empty = {
+    drawers: -1,
+    files: {} as Record<string, { n: number; total: number | null }>,
+  }
   try {
     const db = join(HOME, "opencode-memory", "chroma.sqlite3")
-    const out = execFileSync(
-      process.env.MEMPALACE_PYTHON || "python3",
-      [
-        "-c",
-        "import sqlite3\n" +
-          `c=sqlite3.connect('file:${db}?mode=ro',uri=True,timeout=5)\n` +
-          "print(c.execute('SELECT COUNT(*) FROM embeddings').fetchone()[0])",
-      ],
-      { encoding: "utf-8", timeout: 15000 },
-    ).trim()
-    const n = parseInt(out, 10)
-    return Number.isFinite(n) && n >= 0 ? n : -1
-  } catch {
-    return -1
-  }
+    const script =
+      "import sqlite3,json,sys\n" +
+      "db,paths=json.loads(sys.argv[1])\n" +
+      'r={"drawers":-1,"files":{}}\n' +
+      "try:\n" +
+      ' c=sqlite3.connect("file:%s?mode=ro" % db,uri=True,timeout=5)\n' +
+      ' r["drawers"]=c.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]\n' +
+      " q=\"SELECT s.string_value,COUNT(*),MAX(c.int_value) FROM embedding_metadata s LEFT JOIN embedding_metadata c ON c.id=s.id AND c.key='chunk_total' WHERE s.key='source_file' AND s.string_value IN (%s) GROUP BY s.string_value\" % \",\".join(\"?\"*len(paths))\n" +
+      " [r[\"files\"].__setitem__(f,{\"n\":n,\"total\":t}) for f,n,t in c.execute(q,paths)]\n" +
+      "except Exception:\n" +
+      " pass\n" +
+      "print(json.dumps(r))\n"
+    const args = dbPaths.length > 0 ? [JSON.stringify([db, dbPaths])] : [JSON.stringify([db, ["__none__"]])]
+    const out = execFileSync(process.env.MEMPALACE_PYTHON || "python3", ["-c", script, ...args], {
+      encoding: "utf-8",
+      timeout: 20000,
+    }).trim()
+    const p = JSON.parse(out) as {
+      drawers: number
+      files: Record<string, { n: number; total: number | null }>
+    }
+    if (typeof p?.drawers === "number" && p.files && typeof p.files === "object") return p
+  } catch {}
+  return empty
+}
+
+// Refresh the live progress of the CURRENT wing: palace-wide drawer delta
+// plus, for every file in the wing directory, filed-vs-total chunks.
+// The in-session mine child, if one is running. Tracked so the exit handler
+// can terminate it before spawning a detached replacement (see exitSync);
+// otherwise both would briefly contend for the palace lock.
+let mineChild: ChildProcess | null = null
+
+function pollMineProgress(): void {
+  mineDrawersNow = -1
+  mineFileIndex = 0
+  mineFilesTotal = 0
+  mineFileName = ""
+  mineFileFiled = -1
+  mineFileTotal = null
+  try {
+    const wing = mineWingNames[mineWingIndex]
+    if (wing) {
+      const dir = join(OUT_DIR, wing)
+      // Raw readdir order, deliberately unsorted: the miner walks the same
+      // directory with os.walk, which is the same libc order, so this
+      // matches its processing order in practice. The COUNT is exact
+      // regardless; only the "current file" name assumes the order.
+      const names = readdirSync(dir).filter((n) => n.endsWith(".txt"))
+      if (names.length > 0) {
+        const paths = names.map((n) => {
+          try {
+            return realpathSync(join(dir, n))
+          } catch {
+            return join(dir, n)
+          }
+        })
+        const info = queryFiled(paths)
+        if (info.drawers >= 0) mineDrawersNow = info.drawers
+        mineFilesTotal = names.length
+        let current = -1
+        for (let k = 0; k < names.length; k++) {
+          const rec = info.files[paths[k]]
+          if (!(rec && rec.total != null && rec.n >= rec.total)) {
+            current = k
+            break
+          }
+        }
+        if (current === -1) current = names.length - 1
+        mineFileIndex = current + 1
+        mineFileName = names[current]
+        const rec = info.files[paths[current]]
+        if (rec) {
+          mineFileFiled = rec.n
+          mineFileTotal = rec.total
+        }
+      }
+    }
+  } catch {}
+  writeStatus(true)
 }
 
 function stopMinePoll(): void {
@@ -171,6 +278,12 @@ function stopMinePoll(): void {
   mineDrawersNow = -1
   mineStartedAt = null
   mineWaiting = false
+  mineWingNames = []
+  mineFileIndex = 0
+  mineFilesTotal = 0
+  mineFileName = ""
+  mineFileFiled = -1
+  mineFileTotal = null
 }
 
 function statusEvent(kind: string, data: Record<string, unknown> = {}): void {
@@ -588,10 +701,29 @@ function loadMinedIds(): Map<string, number> {
 // Cost is one tail read per queued file, once per sync. A file with no
 // trailer — anything written by an older version — contributes nothing, which
 // errs toward re-exporting (duplicate memory) rather than losing it.
+// Message ids listed in one queue file's trailer. One tail read, no full
+// scan; a file with no trailer (pre-3.0) yields nothing.
+function readTrailerIds(path: string): string[] {
+  const out: string[] = []
+  try {
+    const size = statSync(path).size
+    const len = Math.min(size, 32 * 1024)
+    const buf = Buffer.alloc(len)
+    const fd = openSync(path, "r")
+    try {
+      readSync(fd, buf, 0, len, size - len)
+    } finally {
+      closeSync(fd)
+    }
+    const m = /\n?<!-- mp-ids: ([^>]*?) -->\s*$/.exec(buf.toString("utf-8"))
+    if (!m) return out
+    for (const id of m[1].split(",")) if (id) out.push(id)
+  } catch {}
+  return out
+}
+
 function queueMessageIds(): Set<string> {
   const ids = new Set<string>()
-  const TAIL = 32 * 1024
-  const TRAILER = /\n?<!-- mp-ids: ([^>]*?) -->\s*$/
   let wings: string[] = []
   try {
     wings = readdirSync(OUT_DIR, { withFileTypes: true })
@@ -608,21 +740,7 @@ function queueMessageIds(): Set<string> {
       continue
     }
     for (const name of files) {
-      try {
-        const path = join(wing, name)
-        const size = statSync(path).size
-        const len = Math.min(size, TAIL)
-        const buf = Buffer.alloc(len)
-        const fd = openSync(path, "r")
-        try {
-          readSync(fd, buf, 0, len, size - len)
-        } finally {
-          closeSync(fd)
-        }
-        const m = TRAILER.exec(buf.toString("utf-8"))
-        if (!m) continue
-        for (const id of m[1].split(",")) if (id) ids.add(id)
-      } catch {}
+      for (const id of readTrailerIds(join(wing, name))) ids.add(id)
     }
   }
   return ids
@@ -1017,30 +1135,48 @@ function doDbSync(): void {
     : (wing: string | null) => (wing ? getLastSync(wing) : getLastSync())
 
   const { wings, exportedIds } = exportNewSessions(cursorFor)
-  if (wings.size === 0) return
+  // The mine covers every wing with pending files — fresh exports from this
+  // run PLUS stale leftovers from failed ones. Mining fresh-only stranded
+  // failures forever: the cursor had already moved past those messages, so
+  // no later export reselected them and no later mine revisited them (seen:
+  // 6 files pending since 09-24 with the cursor weeks past them). The miner
+  // scans the whole directory and skips filed-and-unchanged files in
+  // seconds, so widening the set costs one readdir, not re-work.
+  const mineWings = new Map<string, Map<string, number>>()
+  for (const [wing, ids] of exportedIds) mineWings.set(wing, ids)
+  try {
+    for (const w of readdirSync(OUT_DIR, { withFileTypes: true })) {
+      if (!w.isDirectory()) continue
+      let has = false
+      try {
+        has = readdirSync(join(OUT_DIR, w.name)).some((n) => n.endsWith(".txt"))
+      } catch {}
+      if (has && !mineWings.has(w.name)) mineWings.set(w.name, new Map())
+    }
+  } catch {}
+  if (mineWings.size === 0) return
 
   miningLock = true
   statusPhase = "mining"
-  statusWing = [...wings.keys()].join(",")
+  statusWing = [...mineWings.keys()].join(",")
   statusError = ""
   // The run's progress baseline: which wings, and how full the palace is
-  // now. A 2s poll refreshes the live count while the mine runs; the TUI
-  // shows the delta. Cleared on every terminal path (done, error, busy).
+  // now. A 3s poll refreshes the live count plus per-file filed-vs-total
+  // while the mine runs; the TUI shows the delta. Cleared on every
+  // terminal path (done, error, busy).
   stopMinePoll()
-  mineWingsTotal = wings.size
+  mineWingsTotal = mineWings.size
+  mineWingNames = [...mineWings.keys()]
   mineWingIndex = 0
-  mineDrawersBaseline = palaceDrawersNow()
+  mineDrawersBaseline = queryFiled([]).drawers
   mineDrawersNow = mineDrawersBaseline
   mineStartedAt = new Date().toISOString()
   mineWaiting = false
-  minePoll = setInterval(() => {
-    mineDrawersNow = palaceDrawersNow()
-    writeStatus(true)
-  }, 2000)
-  writeStatus(true)
-  log(`mining ${wingCount(wings)} sessions across ${wings.size} wings`)
+  minePoll = setInterval(pollMineProgress, 3000)
+  pollMineProgress()
+  log(`mining ${wingCount(wings)} sessions across ${mineWings.size} wings`)
 
-  const entries = [...wings.entries()]
+  const entries = [...mineWings.keys()]
   // Per-wing drawers tally for the final toast (parsed from mine stdout).
   const wingDrawers = new Map<string, number>()
   const parseDrawers = (stdout: unknown): number => {
@@ -1069,7 +1205,7 @@ function doDbSync(): void {
       ilog("mine", { outcome: "ok", sessions: wingCount(wings), wings: [...wings.keys()], drawers: totalDrawers, remaining: remaining.total })
       return
     }
-    const [wing, files] = entries[i]
+    const wing = entries[i]
     // Current wing, every attempt: this also repairs the phase between
     // wings, which used to sit at "idle" after each wing finished because
     // only the run start set "mining".
@@ -1082,12 +1218,15 @@ function doDbSync(): void {
     // wrapper shell and orphan the python mine process, which keeps
     // holding the palace lock while the next mine piles up. miningLock
     // already serializes concurrent mines; long mines run to completion.
+    // The child is tracked so the exit handler can terminate it before
+    // spawning a detached replacement (see exitSync).
     const bin = resolveBin()
     if (!bin) { miningLock = false; stopMinePoll(); errLog("mine skipped: mempalace CLI not found"); return }
-    execFile(bin, mineArgs(join(OUT_DIR, wing), wing), {
+    const child = execFile(bin, mineArgs(join(OUT_DIR, wing), wing), {
       encoding: "utf-8",
       maxBuffer: CHILD_MAX_BUFFER,
     }, (err, stdout) => {
+      if (mineChild === child) mineChild = null
       if (err) {
         const msg = err.message || String(err)
         // Lock contention (second opencode instance mining, or an MCP
@@ -1132,7 +1271,7 @@ function doDbSync(): void {
         ilog("mine", { outcome: "error", wing, error: msg.slice(0, 200) })
         return
       }
-      log(`mined wing ${wing} (${files.length} sessions)`)
+      log(`mined wing ${wing}`)
       wingDrawers.set(wing, parseDrawers(stdout))
       statusPhase = "idle"
       statusWing = ""
@@ -1141,10 +1280,25 @@ function doDbSync(): void {
       // The cursor already advanced when these files were written, so a
       // successful mine has no cursor work left to do — it only files the
       // content and releases the queue.
-      // Only THIS wing's message IDs are recorded: other wings' content
-      // is not filed yet, recording it would skip it forever on failure.
-      commitExportedIds(new Map([[wing, exportedIds.get(wing) || new Map()]]))
-      for (const f of files) { try { unlinkSync(f) } catch {} }
+      //
+      // Commit the fresh ids PLUS the trailers of every file just deleted.
+      // Stale files carry messages whose ids were never recorded (their
+      // export run failed before commit), and deleting without recording
+      // would make the next export reselect them. The cursor usually gates
+      // reselection anyway, but the trailer makes it exact; the timestamp
+      // is "now" (retention is age-based, so this errs toward keeping).
+      const doneIds = new Map(exportedIds.get(wing) || [])
+      const gone: string[] = []
+      try {
+        for (const n of readdirSync(join(OUT_DIR, wing))) {
+          if (!n.endsWith(".txt")) continue
+          const p = join(OUT_DIR, wing, n)
+          for (const id of readTrailerIds(p)) if (!doneIds.has(id)) doneIds.set(id, Date.now())
+          gone.push(p)
+        }
+      } catch {}
+      commitExportedIds(new Map([[wing, doneIds]]))
+      for (const f of gone) { try { unlinkSync(f) } catch {} }
       try { rmdirSync(join(OUT_DIR, wing)) } catch {}
       // Truthful progress: one toast per completed wing (an exact % is
       // impossible — the mine CLI is a black box with ~4s startup cost
@@ -1152,95 +1306,136 @@ function doDbSync(): void {
       toast("info", "MemPalace", `wing ${wing} done (${i + 1}/${entries.length})`)
       mineNext(i + 1)
     })
+    mineChild = child
   }
   mineNext(0)
 }
 
-// Best-effort synchronous save for process exit (SIGINT/SIGTERM/exit):
-// only synchronous calls are allowed here. Bounded by EXIT_BUDGET_MS so
-// shutdown stays fast; miningLock is deliberately ignored here because
-// any in-flight async mine dies with the process — at exit this sync
-// mine takes ownership (see PR #1524 review).
-const EXIT_BUDGET_MS = 45000
-const EXIT_WING_TIMEOUT_MS = 30000
-// A wing whose queue is bigger than this cannot be mined inside the exit
-// budget, and trying anyway is worse than not trying: the mine is killed at
-// the timeout having filed part of the backlog, and the next startup faces
-// the same wall. Measured on a 1-core VPS: 6.6 MB of conversations took over
-// 40 minutes, so the budget is not close. A backlog this size is drained by
-// the in-session mine, which has no timeout by design — the exit path only
-// exists to catch up on the small tail.
-const EXIT_MAX_QUEUE_BYTES = 2 * 1024 * 1024
+// Best-effort save for process exit (SIGINT/SIGTERM/SIGHUP/exit): export
+// what's new, then hand the whole pending queue to a DETACHED mine and return
+// immediately — shutdown stays instant no matter how big the backlog is.
+//
+// Why detached: the old code mined synchronously with a 45s budget, which
+// guaranteed failure on any real backlog (measured: 6.6 MB needs 50 minutes,
+// so every exit produced an ETIMEDOUT and the queue never drained). The
+// detached child outlives us and keeps filing; nothing is deleted or
+// committed here. The next startup's mine re-scans, skips filed-and-unchanged
+// files in seconds, and only then deletes files and records ids. A second
+// close while one is still running exits immediately on the lock ("held by")
+// and is logged, not an error: the first one is already doing the work.
+//
+// Resume is duplicate-free by mempalace's own protocol, not by our
+// bookkeeping: every drawer carries its source_file plus the file's
+// chunk_total, so a mine tells a complete file from one that crashed
+// mid-file (#2183), purges stale partial drawers, and refiles only what's
+// missing. Drawer ids are deterministic on content, so even a full re-mine
+// overwrites rather than duplicates. Killing the process at ANY point —
+// reboot, kill -9, power loss — converges on the next mine.
+const DETACHED_FILE = join(HOOK_STATE_DIR, "detached-mines.json")
+const MINE_LOG_RETENTION_MS = 7 * 24 * 3600 * 1000
+type DetachedMine = { pid: number; startedAt: string; wings: string[]; log: string }
+
+function pruneMineLogs(): void {
+  try {
+    const cutoff = Date.now() - MINE_LOG_RETENTION_MS
+    for (const n of readdirSync(HOOK_STATE_DIR)) {
+      if (!/^mine-.*\.log$/.test(n)) continue
+      try {
+        const p = join(HOOK_STATE_DIR, n)
+        if (statSync(p).mtimeMs < cutoff) unlinkSync(p)
+      } catch {}
+    }
+  } catch {}
+}
+
+function recordDetached(spawned: DetachedMine[]): void {
+  try {
+    let known: DetachedMine[] = []
+    try {
+      const raw = JSON.parse(readFileSync(DETACHED_FILE, "utf-8"))
+      if (Array.isArray(raw)) known = raw.filter((e) => typeof e?.pid === "number")
+    } catch {}
+    // Prune dead pids; keep survivors so the next startup can report them.
+    known = known.filter((e) => {
+      try {
+        process.kill(e.pid, 0)
+        return true
+      } catch {
+        return false
+      }
+    })
+    for (const s of spawned) known.push(s)
+    writeFileSync(DETACHED_FILE, JSON.stringify(known.slice(-20)), { mode: 0o600 })
+  } catch (e) {
+    log("detached record err: " + String(e))
+  }
+}
 
 function exitSync(): void {
   try {
     const bin = resolveBin()
     if (!bin) return
-    const { wings, exportedIds } = exportNewSessions((wing) => (wing ? getLastSync(wing) : getLastSync()))
-    if (wings.size === 0) return
-    const deadline = Date.now() + EXIT_BUDGET_MS
-    const done: string[] = []
-    let locked = false
-    for (const [wing] of wings) {
-      const remaining = deadline - Date.now()
-      if (remaining <= 0) { log("exit save: budget exhausted, rest covered next startup"); break }
-      const files = wings.get(wing) || []
-      let bytes = 0
-      for (const f of files) {
-        try { bytes += statSync(f).size } catch {}
+    exportNewSessions((wing) => (wing ? getLastSync(wing) : getLastSync()))
+    // Whole pending dirs, not just this run's export: anything left from
+    // before rides along, and the miner skips filed-and-unchanged files in
+    // seconds (see above for why resume is safe).
+    const pending: string[] = []
+    try {
+      for (const w of readdirSync(OUT_DIR, { withFileTypes: true })) {
+        if (!w.isDirectory()) continue
+        try {
+          if (readdirSync(join(OUT_DIR, w.name)).some((n) => n.endsWith(".txt"))) pending.push(w.name)
+        } catch {}
       }
-      if (bytes > EXIT_MAX_QUEUE_BYTES) {
-        log(
-          `exit save: wing ${wing} has ${files.length} files / ${(bytes / 1048576).toFixed(1)}MB, ` +
-            `over the ${(EXIT_MAX_QUEUE_BYTES / 1048576).toFixed(0)}MB the exit budget can cover — ` +
-            `left for the in-session mine (no timeout), not killed halfway here`,
-        )
-        continue
+    } catch {}
+    if (pending.length === 0) {
+      log("exit save done (queue empty)")
+      return
+    }
+    // Our own attached mine, if any, dies with us — but it can briefly hold
+    // the lock while doing so. Terminate it and give the kernel a moment to
+    // release the flock before spawning the replacement. Worst case the
+    // detached child meets "held by" and exits; the next startup resumes.
+    // Either way nothing corrupts: the lock arbitrates, the resume converges.
+    try {
+      mineChild?.kill("SIGTERM")
+    } catch {}
+    try {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1000)
+    } catch {}
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)
+    const spawned: DetachedMine[] = []
+    for (const wing of pending) {
+      const logPath = join(HOOK_STATE_DIR, `mine-${wing}-${stamp}.log`)
+      let fd: number | null = null
+      try {
+        mkdirSync(HOOK_STATE_DIR, { recursive: true })
+        pruneMineLogs()
+        fd = openSync(logPath, "a", 0o600)
+      } catch {
+        fd = null
       }
-      log(`exit save: mining wing ${wing}`)
-      const res = spawnSync(bin, mineArgs(join(OUT_DIR, wing), wing), {
-        encoding: "utf-8",
-        timeout: Math.min(EXIT_WING_TIMEOUT_MS, remaining),
-        maxBuffer: CHILD_MAX_BUFFER,
-      })
-      if (res.error || res.status !== 0) {
-        // The cause lives on stderr, not in the error object: the process ran
-        // and exited non-zero, so res.error is undefined and res.status is
-        // just the number. Logging the status produced 801 identical lines
-        // reading "exit mine err (wing): 1" — the real message was there all
-        // along, on stderr, and threw away. An error that does not report its
-        // cause is worse than no error.
-        const detail = String(res.stderr || "").trim()
-        const why = (res.error as any)?.message || detail || (res as any).signal || res.status
-        errLog(`exit mine err (${wing}): ${String(why).slice(0, 300)}`)
-        // A palace held by the MCP server is contention, not a failure, and it
-        // applies to every wing equally. Bailing out here meant one blocked
-        // wing abandoned all the others that could have drained. Skip this
-        // one and keep going, exactly as the in-session path does.
-        if (/is held by/i.test(String(why))) {
-          locked = true
-          continue
-        }
-        return
+      try {
+        const child = spawn(bin, mineArgs(join(OUT_DIR, wing), wing), {
+          detached: true,
+          stdio: fd !== null ? ["ignore", fd, fd] : "ignore",
+        })
+        // The parent's copy of fd closes with us; the child's stays open.
+        // unref lets our exit proceed without waiting — the child is adopted
+        // by init and keeps running (verified: parent death, child alive,
+        // log written to completion).
+        child.unref()
+        if (child.pid) spawned.push({ pid: child.pid, startedAt: new Date().toISOString(), wings: [wing], log: logPath })
+        log(`exit save: detached mine for wing ${wing} (pid ${child.pid ?? "?"}) — continues after exit`)
+      } catch (e) {
+        errLog(`exit save: cannot detach mine (${wing}): ${String(e).slice(0, 160)}`)
       }
-      commitExportedIds(new Map([[wing, exportedIds.get(wing) || new Map()]]))
-      done.push(wing)
     }
-    for (const wing of done) {
-      for (const f of wings.get(wing) || []) { try { unlinkSync(f) } catch {} }
-      try { rmdirSync(join(OUT_DIR, wing)) } catch {}
-    }
-    try { rmdirSync(OUT_DIR) } catch {}
-    if (locked) {
-      // Say it once, in the status the TUI reads, so the footer can say WHY
-      // the queue is not draining instead of leaving the user to guess.
-      statusPhase = "busy"
-      statusError = "palace held by another process"
-      writeStatus(true)
-      log("exit save: palace is held by another process — queue left for the in-session mine")
-    }
+    if (spawned.length > 0) recordDetached(spawned)
     log("exit save done")
-  } catch (e) { errLog("exit save err: " + String(e)) }
+  } catch (e) {
+    errLog("exit save err: " + String(e))
+  }
 }
 
 // Shared runtime init for both entrypoints (V1 server() and V2 setup()).
@@ -1262,6 +1457,31 @@ function initRuntime(client: any): void {
   // the exit budget ran out). Fires once per server lifetime.
   setTimeout(() => dbSync(), 10000)
 
+  // A detached mine from a previous session may still be running (it
+  // outlives opencode by design). Report it rather than colliding blindly:
+  // the startup mine above will meet "held by" and interleave via retry,
+  // which is the correct behavior — this line just says why the first
+  // attempt waits.
+  try {
+    const raw = JSON.parse(readFileSync(DETACHED_FILE, "utf-8"))
+    if (Array.isArray(raw)) {
+      const alive = raw.filter((e) => {
+        try {
+          process.kill(e.pid, 0)
+          return true
+        } catch {
+          return false
+        }
+      })
+      for (const e of alive) {
+        log(`detached mine from previous session still running (pid ${e.pid}, wings ${(e.wings || []).join(",")}) — startup mine will interleave via retry`)
+      }
+      if (alive.length !== raw.length) {
+        writeFileSync(DETACHED_FILE, JSON.stringify(alive.slice(-20)), { mode: 0o600 })
+      }
+    }
+  } catch {}
+
   // Startup toast (delayed so the TUI is attached): shows exactly which
   // plugin build is loaded — no more guessing npm-cache vs local build —
   // plus pending backlog so a restarted-into-backlog state is visible.
@@ -1271,10 +1491,11 @@ function initRuntime(client: any): void {
     log(`startup toast fired (${pluginName()} v${pluginVersion()})`)
   }, 15000)
 
-  // Crash safety: best-effort synchronous save on hard exit.
-  // Mirrors the official emergency-save intent (nothing async allowed here).
-  // SIGHUP included: closing the terminal / dropping SSH kills the process
-  // group, otherwise mines would die mid-run with no save attempt.
+  // Crash safety: best-effort save on hard exit. SIGHUP included: closing
+  // the terminal / dropping SSH kills the process group. exitSync exports
+  // what's new and spawns a DETACHED mine per pending wing, so closing
+  // opencode never stops the memory system — the mine continues without us
+  // and the next startup resumes where it left off (see exitSync).
   let exitHandled = false
   const onExit = () => {
     if (exitHandled) return
