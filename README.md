@@ -268,6 +268,8 @@ One clamp remains, and it is the residual cause of the 691-file blow-up: if a re
 
 If the queue stops draining (mines blocked or too slow), `hook.log` gets a `WARNING: N exported files waiting to be mined` line, visible in `/memory-status`. Silence there is what hid the blow-up.
 
+Every mine covers every wing with pending files, not just fresh exports: mining fresh-only stranded failures forever (cursor past, never reselected, never retried). On a wing's success the whole directory is deleted and fresh ids plus deleted-file trailers are committed together.
+
 ### If you purge the palace by hand
 
 `mined_ids` is a claim about the palace: "this message's content was filed". Delete drawers manually — by `source_file`, by age, whatever — and that claim becomes false while the plugin still believes it, so those messages will not be exported again.
@@ -370,14 +372,24 @@ What the bar shows is **queue depth, not progress** — one cell per pending fil
 The third line answers two questions — what is left, and since when — with each clock attached to the thing it measures:
 
 ```
-13 queued · running for 6m · w2/3 · +1,240 drawers   a mine is running
+13 queued · running for 6m · w2/3 · file 4/10 (ses_f367… 120/300) · +1,240 drawers   a mine is running
 9 queued · running for 6m · w1/1 · waiting for palace backed off, lock held
 6 queued · waiting 146h                              waiting its turn
 6 queued · blocked 146h · palace busy                cannot be written at all
 queue empty                                          nothing waiting
 ```
 
-Per-FILE progress does not exist: the miner walks the files silently and only the final summary says what was filed, so the "current item" is the wing (the plugin mines wing by wing and knows the list upfront) plus a live count of drawers the palace has gained since the run started — a read-only `COUNT(*)` over the local Chroma sqlite, polled every 2s while a mine runs. Anything unreadable degrades to elapsed-time-only. No total exists to divide by, so there is deliberately no percentage anywhere.
+Per-FILE progress does not come from the mine: the miner walks the files silently (`for i, filepath in enumerate(files, 1)` — it knows, it just never says) and only the final summary reports. It comes from the palace instead: every filed drawer records its `source_file` plus the file's `chunk_total`, so intersecting the wing directory with the filed set tells exactly which files are done and where the current one stands (`120/300` chunks) — with zero mine overhead. A read-only `COUNT(*)` plus one grouped metadata query, polled every 3s while a mine runs. Anything unreadable degrades to elapsed-time-only.
+
+This is also why per-file mine invocations were considered and dropped: they would buy the same detail at ~56s of startup per file (measured: model load is ~1s of it, the rest is two whole-palace prefetch scans that grow with the palace). The detail is free from metadata; the startup cost is not paid.
+
+### The mine outlives opencode
+
+Closing opencode never stops the memory system. On exit the plugin exports what's new and spawns one DETACHED mine per pending wing, then returns immediately — shutdown stays instant no matter how big the backlog is. (The old 45s-budget synchronous mine is gone: it guaranteed failure on any real backlog, 6.6 MB needing 50 minutes.)
+
+Resume is duplicate-free by mempalace's own protocol, not by plugin bookkeeping: every drawer carries its `source_file` plus the file's `chunk_total`, so a mine tells a complete file from one that crashed mid-file (mempalace #2183), purges stale partial drawers, and refiles only what's missing — and drawer ids are deterministic on content, so even a full re-mine overwrites rather than duplicates. Reboot or `kill -9` at any point converges on the next mine. A second close while one is still running exits immediately on the lock and is logged, not an error.
+
+Detached runs are recorded in `~/.mempalace/hook_state/detached-mines.json` (pid, wings, log) with per-wing logs `mine-<wing>-<ts>.log` pruned after 7 days; the next startup reports a still-running predecessor and interleaves via retry.
 
 Two details cost real time to find, both from `packages/plugin/src/host.ts`:
 

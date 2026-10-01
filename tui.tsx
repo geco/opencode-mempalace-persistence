@@ -45,6 +45,11 @@ type Status = {
   drawersNow?: number
   mineStartedAt?: string
   waiting?: boolean
+  fileIndex?: number
+  filesTotal?: number
+  fileName?: string
+  fileFiled?: number
+  fileTotal?: number | null
 }
 
 const readStatus = (): Status => {
@@ -197,6 +202,23 @@ const summary = (s: Status, q: Queue) => {
         ? ` · w${(s.wingIndex ?? 0) + 1}/${s.wingsTotal}`
         : ""
     const wait = s.waiting ? " · waiting for palace" : ""
+    // Per-file position, read from the palace (filed source_files), not the
+    // mine: the miner walks silently, but every filed drawer records its
+    // source_file plus the file's chunk_total, so completed files and the
+    // current file's chunk fraction are exact with zero mine overhead.
+    let file = ""
+    if (typeof s.filesTotal === "number" && s.filesTotal > 0 && typeof s.fileIndex === "number" && s.fileIndex > 0) {
+      file = ` · file ${s.fileIndex}/${s.filesTotal}`
+      if (s.fileName) {
+        const short = s.fileName.replace(/^sync_/, "").replace(/\.txt$/, "")
+        const name = short.length > 18 ? short.slice(0, 17) + "…" : short
+        if (typeof s.fileFiled === "number" && s.fileFiled >= 0 && typeof s.fileTotal === "number" && s.fileTotal != null) {
+          file += ` (${name} ${s.fileFiled}/${s.fileTotal})`
+        } else {
+          file += ` (${name})`
+        }
+      }
+    }
     let grown = ""
     if (
       typeof s.drawersBaseline === "number" &&
@@ -205,7 +227,7 @@ const summary = (s: Status, q: Queue) => {
     ) {
       grown = ` · +${grouped(s.drawersNow - s.drawersBaseline)} drawers`
     }
-    return `${q.count} queued · running for ${since ? span(since) : "just started"}${wing}${wait}${grown}`
+    return `${q.count} queued · running for ${since ? span(since) : "just started"}${wing}${file}${wait}${grown}`
   }
   if (q.count > 0) {
     const age = q.oldest ? span(q.oldest) : "a while"
