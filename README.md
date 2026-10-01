@@ -362,24 +362,15 @@ The plugin exports everything in the opencode database on the next sync, then re
 The plugin ships a second entry point, `tui.tsx`, that claims the sidebar footer:
 
 ```
-◆ MemPalace  queue
-██████░░░░░░░░░░░░░░░
-6 queued · waiting 146h
+◆ MP mining 4/10 q8 w2/2 for 6m +1,240
+██████████▓▓▓░░░░░░░░░░░░░
 ```
 
-What the bar shows is **queue depth, not progress** — one cell per pending file, capped at 24. It was a percentage at first and that was wrong: there is no real percentage to show (`mempalace mine` is a black box), so an animated 0→100 loop just read as a job stuck at 99%. A progress indicator that lies is the worst possible thing in a memory plugin. While a mine is actually running a `▓▓▓` window sweeps across the bar so activity is visible without inventing a number; idle, the bar is **completely still** and no timer is running.
+Two lines. Line 1 is compact tokens: `◆` semaphore (green idle, blue mining, yellow queue/blocked, red error), `MP` tag, phase, files completed over files in the current wing (`4/10`, bare — the q- and w- prefixes mark the other counters), files queued live (`q8`), wing over wings (`w2/2`, always shown — `w1/1` confirms the run was scoped), elapsed of this run (`for 6m`), drawers gained (`+1,240`). Other states: `◆ MP queue q6 waiting 146h`, `◆ MP blocked q6 waiting 146h palace busy`, `◆ MP idle`.
 
-The third line answers two questions — what is left, and since when — with each clock attached to the thing it measures:
+Line 2 is a REAL fraction — completed files over total files of the run, queued arrivals included — not a gauge. What the bar shows is **queue depth, not progress** is over: the old gauge filled with the queue and could never drain visually. A percentage was tried first and was wrong (`mempalace mine` is a black box: no total to divide by, so an animated 0→100 loop read as a job stuck at 99%). A fraction of files is exact; a percentage of "done" would be invented. The `▓▓▓` window sweeps while mining so a slow batch (minutes between commits) still looks alive; idle with a queue the bar sits empty; idle with nothing queued it sits full — the work is done.
 
-```
-13 queued · running for 6m · w2/3 · file 4/10 (ses_f367… 120/300) · +1,240 drawers   a mine is running
-9 queued · running for 6m · w1/1 · waiting for palace backed off, lock held
-6 queued · waiting 146h                              waiting its turn
-6 queued · blocked 146h · palace busy                cannot be written at all
-queue empty                                          nothing waiting
-```
-
-Per-FILE progress does not come from the mine: the miner walks the files silently (`for i, filepath in enumerate(files, 1)` — it knows, it just never says) and only the final summary reports. It comes from the palace instead: every filed drawer records its `source_file` plus the file's `chunk_total`, so intersecting the wing directory with the filed set tells exactly which files are done and where the current one stands (`120/300` chunks) — with zero mine overhead. A read-only `COUNT(*)` plus one grouped metadata query, polled every 3s while a mine runs. Anything unreadable degrades to elapsed-time-only.
+Per-FILE completion does not come from the mine: the miner walks the files silently (`for i, filepath in enumerate(files, 1)` — it knows, it just never says) and only the final summary reports. It comes from the palace instead: every filed drawer records its `source_file` plus the file's `chunk_total`, so intersecting the wing directory with the filed set tells exactly which files are done — with zero mine overhead. A read-only `COUNT(*)` plus one grouped metadata query, polled every 3s while a mine runs. Anything unreadable degrades to elapsed-time-only.
 
 This is also why per-file mine invocations were considered and dropped: they would buy the same detail at ~56s of startup per file (measured: model load is ~1s of it, the rest is two whole-palace prefetch scans that grow with the palace). The detail is free from metadata; the startup cost is not paid.
 

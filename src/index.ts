@@ -96,6 +96,8 @@ function writeStatus(force = false): void {
         plugin: `${pluginName()} v${pluginVersion()}`,
         wingIndex: mineWingsTotal > 0 ? mineWingIndex : undefined,
         wingsTotal: mineWingsTotal > 0 ? mineWingsTotal : undefined,
+        runDone: mineRunTotal > 0 ? mineRunDone : undefined,
+        runTotal: mineRunTotal > 0 ? mineRunTotal : undefined,
         drawersBaseline: mineDrawersBaseline >= 0 ? mineDrawersBaseline : undefined,
         drawersNow: mineDrawersNow >= 0 ? mineDrawersNow : undefined,
         mineStartedAt: mineStartedAt || undefined,
@@ -157,9 +159,17 @@ let mineStartedAt: string | null = null
 // footer shows a running mine with a frozen "+0 drawers" and no reason.
 let mineWaiting = false
 
-function palaceDrawersNow(): number {
-  return queryFiled([]).drawers
-}
+// Snapshot of per-wing file counts at run start, for the run-level progress
+// fraction. Done wings contribute their snapshot (their dirs are deleted on
+// success, so they can't be relisted); the current wing is listed live, so
+// files arriving mid-run join the denominator — the bar can dip when new
+// work arrives, which is honest: the total grew.
+let mineWingSnapshots: Record<string, number> = {}
+// Run-level progress: completed files over total files across the run's
+// wings, queued arrivals included. Monotonic within a run except when new
+// files land mid-run (see above).
+let mineRunDone = 0
+let mineRunTotal = 0
 
 // Filed-set for exact per-file progress, read from the palace.
 //
@@ -225,7 +235,16 @@ function pollMineProgress(): void {
   mineFileName = ""
   mineFileFiled = -1
   mineFileTotal = null
+  mineRunDone = 0
+  mineRunTotal = 0
   try {
+    // Done wings (index below current) contribute their start snapshot —
+    // their dirs are deleted on success. The current wing is listed live.
+    for (let w = 0; w < mineWingIndex && w < mineWingNames.length; w++) {
+      const snap = mineWingSnapshots[mineWingNames[w]] || 0
+      mineRunDone += snap
+      mineRunTotal += snap
+    }
     const wing = mineWingNames[mineWingIndex]
     if (wing) {
       const dir = join(OUT_DIR, wing)
@@ -246,11 +265,13 @@ function pollMineProgress(): void {
         if (info.drawers >= 0) mineDrawersNow = info.drawers
         mineFilesTotal = names.length
         let current = -1
+        let done = 0
         for (let k = 0; k < names.length; k++) {
           const rec = info.files[paths[k]]
-          if (!(rec && rec.total != null && rec.n >= rec.total)) {
+          if (rec && rec.total != null && rec.n >= rec.total) {
+            done++
+          } else if (current === -1) {
             current = k
-            break
           }
         }
         if (current === -1) current = names.length - 1
@@ -261,6 +282,14 @@ function pollMineProgress(): void {
           mineFileFiled = rec.n
           mineFileTotal = rec.total
         }
+        mineRunDone += done
+        mineRunTotal += names.length
+      } else {
+        // Dir listed but empty (or unreadable): if the snapshot had files,
+        // the wing just finished between polls — count it done.
+        const snap = mineWingSnapshots[wing] || 0
+        mineRunDone += snap
+        mineRunTotal += snap
       }
     }
   } catch {}
@@ -279,6 +308,9 @@ function stopMinePoll(): void {
   mineStartedAt = null
   mineWaiting = false
   mineWingNames = []
+  mineWingSnapshots = {}
+  mineRunDone = 0
+  mineRunTotal = 0
   mineFileIndex = 0
   mineFilesTotal = 0
   mineFileName = ""
@@ -1167,6 +1199,19 @@ function doDbSync(): void {
   stopMinePoll()
   mineWingsTotal = mineWings.size
   mineWingNames = [...mineWings.keys()]
+  // Snapshot per-wing file counts: done wings are deleted on success and
+  // can't be relisted, so their contribution to the run fraction comes from
+  // here. The current wing is listed live each poll (see pollMineProgress).
+  mineWingSnapshots = {}
+  for (const w of mineWingNames) {
+    try {
+      mineWingSnapshots[w] = readdirSync(join(OUT_DIR, w)).filter((n) => n.endsWith(".txt")).length
+    } catch {
+      mineWingSnapshots[w] = 0
+    }
+  }
+  mineRunDone = 0
+  mineRunTotal = 0
   mineWingIndex = 0
   mineDrawersBaseline = queryFiled([]).drawers
   mineDrawersNow = mineDrawersBaseline

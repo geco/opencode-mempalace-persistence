@@ -41,6 +41,8 @@ type Status = {
   plugin?: string
   wingIndex?: number
   wingsTotal?: number
+  runDone?: number
+  runTotal?: number
   drawersBaseline?: number
   drawersNow?: number
   mineStartedAt?: string
@@ -109,34 +111,12 @@ const skinOf = (theme: any) => ({
 
 const FILLED = "█"
 const EMPTY = "░"
-
-// A bar that fills to 100% and loops back lies about progress: the mine CLI is
-// a black box, so there is no real percentage to show, and the first version's
-// "0..100 forever" read as a job stuck at 99%. What IS real is the queue
-// depth, so the bar is a gauge of it — empty when the queue is drained, fuller
-// as the backlog grows. While a mine runs a cursor sweeps over it, so activity
-// is visible without inventing a number.
 const GAUGE_MAX = 24
 
-const gauge = (pending: number) => {
-  const n = Math.max(0, Math.min(GAUGE_MAX, Math.round(pending)))
-  return FILLED.repeat(n) + EMPTY.repeat(GAUGE_MAX - n)
-}
-
-// Indeterminate sweep: a lit window sliding across the gauge while mining.
-// A different glyph on purpose — with the same one the window is invisible
-// while it sits over the filled part, so the first seconds of a mine would
-// look frozen.
+// Sweep glyph, different on purpose: with the same glyph the window is
+// invisible while it sits over the filled part, so a slow batch would look
+// frozen for minutes.
 const SWEEP = "▓"
-
-const sweep = (pending: number, step: number) => {
-  const cells: string[] = Array.from({ length: GAUGE_MAX }, (_, i) =>
-    i < Math.min(GAUGE_MAX, Math.max(0, Math.round(pending))) ? FILLED : EMPTY,
-  )
-  const head = Math.abs(step) % GAUGE_MAX
-  for (let i = 0; i < 3; i++) cells[(head + i) % GAUGE_MAX] = SWEEP
-  return cells.join("")
-}
 
 // How long something has been going, as a short span. The label already says
 // what is being measured ("running for", "waiting"), and a second clock on
@@ -160,14 +140,6 @@ const span = (ms: number) => {
 const working = (s: Status) => s.phase === "mining"
 const backlogged = (s: Status, q: Queue) => !working(s) && q.count > 0
 
-const PHASE_LABEL: Record<Phase, string> = {
-  idle: "idle",
-  mining: "mining",
-  busy: "palace busy",
-  error: "error",
-  unknown: "waiting",
-}
-
 // Thousand grouping, done by hand: toLocaleString silently returns ungrouped
 // digits on runtimes without full ICU data (seen: "1240" instead of "1,240"),
 // and a counter that sometimes groups and sometimes does not is worse than
@@ -175,70 +147,84 @@ const PHASE_LABEL: Record<Phase, string> = {
 const grouped = (n: number) =>
   String(Math.trunc(Math.abs(n))).replace(/\B(?=(\d{3})+(?!\d))/g, ",")
 
-// The one line that answers both questions, with each clock attached to the
-// thing it measures:
+// The footer is two lines: a status line of compact tokens, and a TRUE
+// progress bar underneath.
 //
-//   mining  -> how long the current mine has been running, which wing of the
-//              run it is on, and how many drawers the palace has gained
-//   backlog -> how long the oldest queued file has been waiting
-//   drained -> nothing to wait for
+// Line 1 (mining):  ◆ MP mining 4/10 q8 w2/2 for 6m +1,240
+//   ◆        semaphore: green idle, blue mining, yellow queue/blocked, red error
+//   MP       fixed tag (was "MemPalace", shortened — the bar below says it too)
+//   mining   phase: mining | queue | blocked | idle
+//   4/10     files completed over files in the current wing, read from the
+//            palace (filed source_files), not the mine. Bare on purpose:
+//            the q- and w- prefixes mark the other two counters.
+//   q8       files currently queued, counted live from the directory
+//   w2/2     current wing over wings of this run, known upfront
+//   for 6m   elapsed of THIS run (dedicated clock; the status file's own ts
+//            is rewritten on every write and flickered 1s/2s when misused)
+//   +1,240   drawers the palace gained since run start (all writers counted;
+//            in practice the mine, MCP writes are a drawer at a time)
+// Line 1 (other states):
+//   ◆ MP queue q6 waiting 146h
+//   ◆ MP blocked q6 waiting 146h palace busy
+//   ◆ MP idle
 //
-// No percentage: the mine CLI exposes no total to divide by, and an invented
-// one reads as a job stuck at 99%. Per-FILE progress does not exist either —
-// the miner walks the files silently and only the final summary says what
-// was filed — so the "current item" is the wing (known upfront, the plugin
-// mines wing by wing) plus the live drawer count. A negative delta (a
-// concurrent prune removed rows mid-run) is omitted rather than shown.
-//
-// The elapsed clock is mineStartedAt, set once when the run starts. The
-// status file's own `ts` is rewritten on every write (including the 2s
-// progress poll), so using it made the line flicker between "running for 1s"
-// and "running for 2s" forever.
-const summary = (s: Status, q: Queue) => {
+// Line 2 is a REAL fraction, not a gauge: completed files over total files
+// of the run, queued arrivals included (they join the denominator when they
+// land, so the bar can dip when new work arrives — honest). New files that
+// arrive mid-run belong to the next run's scope for the miner, but they sit
+// in the same directory, so they count here. Monotonic within a run except
+// for that case. 24 cells; the ▓▓▓ window sweeps while mining so a slow
+// batch (minutes between commits) still looks alive. Idle with a queue: the
+// bar is empty (nothing elaborated). Idle with nothing queued: full — the
+// work is done. No percentage anywhere: a fraction of files is exact, a
+// percentage of "done" would be invented.
+const runFrac = (s: Status, q: Queue): number => {
+  if (s.phase === "mining" && typeof s.runTotal === "number" && s.runTotal > 0) {
+    return Math.max(0, Math.min(1, (s.runDone ?? 0) / s.runTotal))
+  }
+  if (q.count === 0) return 1
+  return 0
+}
+
+const barLine = (s: Status, q: Queue, tick: number): string => {
+  const frac = runFrac(s, q)
+  const filled = Math.max(0, Math.min(GAUGE_MAX, Math.round(frac * GAUGE_MAX)))
+  const cells: string[] = Array.from({ length: GAUGE_MAX }, (_, i) => (i < filled ? FILLED : EMPTY))
+  if (s.phase === "mining") {
+    const head = Math.abs(tick) % GAUGE_MAX
+    for (let i = 0; i < 3; i++) cells[(head + i) % GAUGE_MAX] = SWEEP
+  }
+  return cells.join("")
+}
+
+const line1 = (s: Status, q: Queue): string => {
   if (working(s)) {
     const since = s.mineStartedAt ? Date.parse(s.mineStartedAt) : 0
-    const wing =
-      typeof s.wingsTotal === "number" && s.wingsTotal > 0
-        ? ` · w${(s.wingIndex ?? 0) + 1}/${s.wingsTotal}`
+    const file =
+      typeof s.filesTotal === "number" && s.filesTotal > 0 && typeof s.fileIndex === "number" && s.fileIndex > 0
+        ? ` ${s.fileIndex}/${s.filesTotal}`
         : ""
-    const wait = s.waiting ? " · waiting for palace" : ""
-    // Per-file position, read from the palace (filed source_files), not the
-    // mine: the miner walks silently, but every filed drawer records its
-    // source_file plus the file's chunk_total, so completed files and the
-    // current file's chunk fraction are exact with zero mine overhead.
-    let file = ""
-    if (typeof s.filesTotal === "number" && s.filesTotal > 0 && typeof s.fileIndex === "number" && s.fileIndex > 0) {
-      file = ` · file ${s.fileIndex}/${s.filesTotal}`
-      if (s.fileName) {
-        const short = s.fileName.replace(/^sync_/, "").replace(/\.txt$/, "")
-        const name = short.length > 18 ? short.slice(0, 17) + "…" : short
-        if (typeof s.fileFiled === "number" && s.fileFiled >= 0 && typeof s.fileTotal === "number" && s.fileTotal != null) {
-          file += ` (${name} ${s.fileFiled}/${s.fileTotal})`
-        } else {
-          file += ` (${name})`
-        }
-      }
-    }
+    const wing =
+      typeof s.wingsTotal === "number" && s.wingsTotal > 0 ? ` w${(s.wingIndex ?? 0) + 1}/${s.wingsTotal}` : ""
+    const wait = s.waiting ? " waiting for palace" : ""
     let grown = ""
     if (
       typeof s.drawersBaseline === "number" &&
       typeof s.drawersNow === "number" &&
       s.drawersNow - s.drawersBaseline >= 0
     ) {
-      grown = ` · +${grouped(s.drawersNow - s.drawersBaseline)} drawers`
+      grown = ` +${grouped(s.drawersNow - s.drawersBaseline)}`
     }
-    return `${q.count} queued · running for ${since ? span(since) : "just started"}${wing}${file}${wait}${grown}`
+    return `◆ MP mining${file} q${q.count}${wing} for ${since ? span(since) : "just started"}${wait}${grown}`
   }
   if (q.count > 0) {
     const age = q.oldest ? span(q.oldest) : "a while"
     // When the palace is held by another process the queue is not waiting
     // because nothing wants it: it is waiting because it cannot be written.
-    // Saying so is the difference between a user who waits and a user who
-    // goes and closes the thing holding the lock.
-    if (s.phase === "busy" || s.error) return `${q.count} queued · blocked ${age} · palace busy`
-    return `${q.count} queued · waiting ${age}`
+    if (s.phase === "busy" || s.error) return `◆ MP blocked q${q.count} waiting ${age} palace busy`
+    return `◆ MP queue q${q.count} waiting ${age}`
   }
-  return "queue empty"
+  return "◆ MP idle"
 }
 
 export default {
@@ -292,33 +278,13 @@ export default {
       return skin.success
     }
 
-    // The header word: the state of the WORK, not of the process. A queue
-    // held by another writer is "blocked", which is a different problem with
-    // a different fix than a queue nobody has got to yet. While mining, the
-    // wing counter says which slice of the run this is — always shown, even
-    // for a single wing, because "w1/1" confirms the run was scoped at all.
-    const label = () => {
-      const s = status()
-      const q = queue()
-      if (s.phase === "mining") {
-        if (typeof s.wingsTotal === "number" && s.wingsTotal > 0) {
-          return `mining · w${(s.wingIndex ?? 0) + 1}/${s.wingsTotal}`
-        }
-        return PHASE_LABEL[s.phase] ?? s.phase
-      }
-      if (q.count > 0) return s.phase === "busy" || s.error ? "blocked" : "queue"
-      return PHASE_LABEL[s.phase] ?? s.phase
-    }
-
-    // The bar itself: a gauge of the queue, lit only while a mine is running.
-    const gaugeLine = () => {
-      const n = queue().count
-      return working(status()) ? sweep(n, tick()) : gauge(n)
-    }
+    // Two lines only; the label() and summary() split was merged into line1()
+    // when the format went compact — one token stream, no duplication.
 
     // One claim, one place: the sidebar footer. A compact mirror in the prompt
     // footer was tried and removed — two bars showing the same state read as
     // noise, and the prompt line is the most visually loaded area of the TUI.
+    // Two lines: the compact status tokens, then the true progress bar.
     const off = ctx.ui.slot({
       append: "sidebar.footer",
       render: () => {
@@ -326,14 +292,8 @@ export default {
         const q = queue()
         return (
           <box flexDirection="column" gap={0} flexShrink={0}>
-            <box flexDirection="row" gap={1}>
-              <text fg={tone()}>
-                <span style={{ fg: tone() }}>◆</span> MemPalace
-              </text>
-              <text fg={backlogged(s, q) ? skin.warning : skin.muted}>{label()}</text>
-            </box>
-            <text fg={tone()}>{gaugeLine()}</text>
-            <text fg={skin.muted}>{summary(s, q)}</text>
+            <text fg={tone()}>{line1(s, q)}</text>
+            <text fg={tone()}>{barLine(s, q, tick())}</text>
           </box>
         )
       },
