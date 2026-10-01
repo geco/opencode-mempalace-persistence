@@ -52,6 +52,7 @@ type Status = {
   fileName?: string
   fileFiled?: number
   fileTotal?: number | null
+  lastRun?: { wings: number; files: number; drawers: number; at: string }
 }
 
 const readStatus = (): Status => {
@@ -178,16 +179,21 @@ const grouped = (n: number) =>
 // bar is empty (nothing elaborated). Idle with nothing queued: full — the
 // work is done. No percentage anywhere: a fraction of files is exact, a
 // percentage of "done" would be invented.
-const runFrac = (s: Status, q: Queue): number => {
+const runFrac = (s: Status): number => {
   if (s.phase === "mining" && typeof s.runTotal === "number" && s.runTotal > 0) {
     return Math.max(0, Math.min(1, (s.runDone ?? 0) / s.runTotal))
   }
-  if (q.count === 0) return 1
+  // Idle is always an empty bar, even with nothing queued: a full bar reads
+  // as garish when there is nothing running, and "done" is said by the line
+  // above (idle + last run summary), not by the bar. The mining fill, in
+  // accent color, is then unmistakably the "executing" state.
   return 0
 }
 
-const barLine = (s: Status, q: Queue, tick: number): string => {
-  const frac = runFrac(s, q)
+const plural = (n: number, one: string, many: string) => (n === 1 ? `1 ${one}` : `${n} ${many}`)
+
+const barLine = (s: Status, tick: number): string => {
+  const frac = runFrac(s)
   const filled = Math.max(0, Math.min(GAUGE_MAX, Math.round(frac * GAUGE_MAX)))
   const cells: string[] = Array.from({ length: GAUGE_MAX }, (_, i) => (i < filled ? FILLED : EMPTY))
   if (s.phase === "mining") {
@@ -223,6 +229,13 @@ const line1 = (s: Status, q: Queue): string => {
     // because nothing wants it: it is waiting because it cannot be written.
     if (s.phase === "busy" || s.error) return `◆ MP blocked q${q.count} waiting ${age} palace busy`
     return `◆ MP queue q${q.count} waiting ${age}`
+  }
+  // Idle with nothing queued: say when the last work finished, so there is
+  // something reassuring to read. Without a recorded run, plain idle.
+  const last = s.lastRun
+  if (last && last.files > 0) {
+    const at = last.at ? Date.parse(last.at) : 0
+    return `◆ MP idle ${plural(last.files, "file", "files")} ${plural(last.wings, "wing", "wings")} +${grouped(last.drawers)}${at ? ` ${span(at)} ago` : ""}`
   }
   return "◆ MP idle"
 }
@@ -293,7 +306,7 @@ export default {
         return (
           <box flexDirection="column" gap={0} flexShrink={0}>
             <text fg={tone()}>{line1(s, q)}</text>
-            <text fg={tone()}>{barLine(s, q, tick())}</text>
+            <text fg={tone()}>{barLine(s, tick())}</text>
           </box>
         )
       },

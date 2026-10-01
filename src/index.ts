@@ -107,6 +107,7 @@ function writeStatus(force = false): void {
         fileName: mineFileName || undefined,
         fileFiled: mineFileFiled >= 0 ? mineFileFiled : undefined,
         fileTotal: mineFileTotal != null ? mineFileTotal : undefined,
+        lastRun: statusLastRun || undefined,
       }),
       { mode: 0o600 },
     )
@@ -684,7 +685,25 @@ function summarizeToolCall(tool: string, args: any, out: any): string {
   return `${short} · asked: ${asked} → ${answered}`.slice(0, 260)
 }
 
-interface SyncState { last_sync_ms: number; wings?: Record<string, number>; mined_ids?: Record<string, number> }
+interface LastRun { wings: number; files: number; drawers: number; at: string }
+interface SyncState {
+  last_sync_ms: number
+  wings?: Record<string, number>
+  mined_ids?: Record<string, number>
+  last_run?: LastRun
+}
+
+function validLastRun(v: unknown): v is LastRun {
+  const r = v as Record<string, unknown>
+  return (
+    !!r &&
+    typeof r === "object" &&
+    typeof r.wings === "number" &&
+    typeof r.files === "number" &&
+    typeof r.drawers === "number" &&
+    typeof r.at === "string"
+  )
+}
 
 function readSyncState(): SyncState {
   try {
@@ -694,10 +713,28 @@ function readSyncState(): SyncState {
         last_sync_ms: raw.last_sync_ms,
         wings: raw.wings && typeof raw.wings === "object" ? raw.wings : {},
         mined_ids: raw.mined_ids && typeof raw.mined_ids === "object" ? raw.mined_ids : {},
+        last_run: validLastRun(raw.last_run) ? raw.last_run : undefined,
       }
     }
   } catch {}
   return { last_sync_ms: 0, wings: {}, mined_ids: {} }
+}
+
+// Summary of the last completed run, for the idle footer ("mined 9 files,
+// 2 wings, +1,240 drawers, 25m ago"). Persisted in sync_state.json so it
+// survives restarts — module state alone would leave a fresh boot with
+// nothing reassuring to say.
+let statusLastRun: LastRun | null = null
+
+function persistLastRun(r: LastRun): void {
+  statusLastRun = r
+  try {
+    const st = readSyncState()
+    st.last_run = r
+    writeFileSync(STATE_FILE, JSON.stringify(st))
+  } catch (e) {
+    log("last-run write err: " + String(e))
+  }
 }
 
 // Message IDs whose content is already IN THE PALACE. Committed only when a
@@ -1237,6 +1274,10 @@ function doDbSync(): void {
   const mineNext = (i: number, attempt = 0): void => {
     if (i >= entries.length) {
       miningLock = false
+      // Capture the run totals BEFORE stopMinePoll() clears them: this is
+      // the summary the idle footer shows until the next run.
+      const runFiles = Object.values(mineWingSnapshots).reduce((a, b) => a + (b || 0), 0)
+      const runWings = mineWingsTotal
       stopMinePoll()
       cleanupExport(wings)
       log("mine done")
@@ -1248,6 +1289,7 @@ function doDbSync(): void {
       const tail = remaining.total > 0 ? `, ${remaining.total} message(s) still waiting` : ", queue empty"
       toast("success", "MemPalace", `mined ${wingCount(wings)} session(s) → ${names}${detail}${tail}`)
       ilog("mine", { outcome: "ok", sessions: wingCount(wings), wings: [...wings.keys()], drawers: totalDrawers, remaining: remaining.total })
+      persistLastRun({ wings: runWings, files: runFiles, drawers: totalDrawers, at: new Date().toISOString() })
       // Forced: stopMinePoll() above cleared the run's fields, and ilog's
       // throttled write may drop. Without this the file keeps the last
       // poll's mining fields forever (seen live: phase idle with wingIndex
@@ -1503,6 +1545,12 @@ function initRuntime(client: any): void {
   autoInject = isAutoInjectEnabled()
   identity = readIdentity()
   interval = saveInterval()
+  // Last run summary survives restarts (persisted in sync_state.json), so a
+  // fresh boot still has something reassuring to show until the first mine.
+  try {
+    const last = readSyncState().last_run
+    if (validLastRun(last)) statusLastRun = last
+  } catch {}
   writeStatus(true)
   log(`loaded (autoInjectContext: ${autoInject}, saveInterval: ${interval})`)
 
