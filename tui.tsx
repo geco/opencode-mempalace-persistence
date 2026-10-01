@@ -55,6 +55,7 @@ type Status = {
   lastRun?: { wings: number; files: number; drawers: number; at: string }
   querying?: { tool: string; text: string; startedAt?: string }
   lastQuery?: { tool: string; text: string | null; at: string; count: number | null }
+  blockedBy?: string
 }
 
 const readStatus = (): Status => {
@@ -252,7 +253,20 @@ const line1 = (s: Status, q: Queue): string => {
         : ""
     const wing =
       typeof s.wingsTotal === "number" && s.wingsTotal > 0 ? ` w${(s.wingIndex ?? 0) + 1}/${s.wingsTotal}` : ""
-    const wait = s.waiting ? " wait" : ""
+    // Reached only when NOT waiting (waiting returns below): the full
+    // detail line with live counters.
+    // While waiting with a known holder, the holder displaces everything
+    // frozen: file counter, queue depth and drawer delta do not move during
+    // backoff, so they cost width for zero information. What moves is the
+    // clock, and what matters is who to close. "by mcp:950803" says it.
+    // Width-budgeted: the full detail line returns when unblocked.
+    if (s.waiting) {
+      const since = s.mineStartedAt ? Date.parse(s.mineStartedAt) : 0
+      const wing =
+        typeof s.wingsTotal === "number" && s.wingsTotal > 0 ? ` w${(s.wingIndex ?? 0) + 1}/${s.wingsTotal}` : ""
+      const holder = s.blockedBy ? ` by ${s.blockedBy}` : ""
+      return `◆ MP mining${wing} ${since ? span(since) : "just started"} wait${holder}`
+    }
     let grown = ""
     if (
       typeof s.drawersBaseline === "number" &&
@@ -261,7 +275,7 @@ const line1 = (s: Status, q: Queue): string => {
     ) {
       grown = ` +${grouped(s.drawersNow - s.drawersBaseline)}d`
     }
-    return `◆ MP mining${file} q${q.count}${wing} ${since ? span(since) : "just started"}${wait}${grown}`
+    return `◆ MP mining${file} q${q.count}${wing} ${since ? span(since) : "just started"}${grown}`
   }
   if (q.count > 0) {
     const age = q.oldest ? span(q.oldest) : "a while"

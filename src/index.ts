@@ -102,6 +102,7 @@ function writeStatus(force = false): void {
         drawersNow: mineDrawersNow >= 0 ? mineDrawersNow : undefined,
         mineStartedAt: mineStartedAt || undefined,
         waiting: mineWaiting || undefined,
+        blockedBy: mineBlockedBy || undefined,
         querying: statusQuery || undefined,
         lastQuery: statusLastQuery || undefined,
         fileIndex: mineFilesTotal > 0 ? mineFileIndex : undefined,
@@ -161,6 +162,26 @@ let mineStartedAt: string | null = null
 // mine process exists and no drawers are being filed. Without this the
 // footer shows a running mine with a frozen "+0 drawers" and no reason.
 let mineWaiting = false
+
+// Who holds the palace lock, when we last failed to take it, as
+// "mcp:950803" / "mine:960758". Parsed from mempalace's own diagnostic
+// ("palace … is held by PID 913732 (…/mempalace-mcp)"), which names names.
+// Shown in the footer only while actively waiting (fresh: seen seconds
+// ago on the last attempt) — never on give-up, where it may already be
+// stale. Lets the user decide: wait, or close/kill the holder.
+let mineBlockedBy: string | null = null
+
+function shortHolder(msg: string): string | null {
+  try {
+    const m = /is held by PID (\d+) \(([^)]+)\)/.exec(msg)
+    if (!m) return null
+    const cmd = m[2]
+    const kind = /mcp/i.test(cmd) ? "mcp" : /\bmine\b/i.test(cmd) ? "mine" : (cmd.split("/").pop() || "?").split(" ")[0]
+    return `${kind}:${m[1]}`
+  } catch {
+    return null
+  }
+}
 
 // Snapshot of per-wing file counts at run start, for the run-level progress
 // fraction. Done wings contribute their snapshot (their dirs are deleted on
@@ -310,6 +331,7 @@ function stopMinePoll(): void {
   mineDrawersNow = -1
   mineStartedAt = null
   mineWaiting = false
+  mineBlockedBy = null
   mineWingNames = []
   mineWingSnapshots = {}
   mineRunDone = 0
@@ -1405,6 +1427,7 @@ function doDbSync(): void {
     // only the run start set "mining".
     mineWingIndex = i
     mineWaiting = false
+    mineBlockedBy = null
     statusPhase = "mining"
     statusWing = wing
     writeStatus(true)
@@ -1434,8 +1457,11 @@ function doDbSync(): void {
           // No mine process exists during the wait, so say so: otherwise the
           // footer shows a running mine with a frozen drawer count and no
           // reason. (log() above is dropped unless DEBUG is on, so without
-          // this flag the backoff is invisible everywhere.)
+          // this flag the backoff is invisible everywhere.) The holder
+          // identity comes from mempalace's own message and tells the user
+          // WHO to close/kill — refreshed on every attempt.
           mineWaiting = true
+          mineBlockedBy = shortHolder(msg)
           writeStatus(true)
           const nowTs = Date.now()
           if (nowTs - lastBusyToastTs > BUSY_TOAST_WINDOW_MS) {
@@ -1449,10 +1475,11 @@ function doDbSync(): void {
         if (/is held by/i.test(msg)) {
           statusPhase = "busy"
           statusWing = wing
+          const holder = mineBlockedBy
           stopMinePoll()
           statusEvent("mine", { outcome: "busy", wing })
           log(`mine skipped, palace busy (${wing}) after ${attempt} retries — next trigger will retry`)
-          ilog("mine", { outcome: "busy", wing })
+          ilog("mine", { outcome: "busy", wing, holder: holder || undefined })
           // Forced, same reason as the done path: the throttled write may
           // drop and the busy state would never reach the file.
           writeStatus(true)
