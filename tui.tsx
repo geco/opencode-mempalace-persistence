@@ -190,8 +190,6 @@ const runFrac = (s: Status): number => {
   return 0
 }
 
-const plural = (n: number, one: string, many: string) => (n === 1 ? `1 ${one}` : `${n} ${many}`)
-
 const barLine = (s: Status, tick: number): string => {
   const frac = runFrac(s)
   const filled = Math.max(0, Math.min(GAUGE_MAX, Math.round(frac * GAUGE_MAX)))
@@ -230,12 +228,11 @@ const line1 = (s: Status, q: Queue): string => {
     if (s.phase === "busy" || s.error) return `◆ MP blocked q${q.count} waiting ${age} palace busy`
     return `◆ MP queue q${q.count} waiting ${age}`
   }
-  // Idle with nothing queued: say when the last work finished, so there is
-  // something reassuring to read. Without a recorded run, plain idle.
+  // Idle with nothing queued: last completed run in compact tokens.
   const last = s.lastRun
   if (last && last.files > 0) {
     const at = last.at ? Date.parse(last.at) : 0
-    return `◆ MP idle ${plural(last.files, "file", "files")} ${plural(last.wings, "wing", "wings")} +${grouped(last.drawers)}${at ? ` ${span(at)} ago` : ""}`
+    return `◆ MP idle ${last.files}f ${last.wings}w${at ? ` ${span(at)} ago` : ""} (+${grouped(last.drawers)} drawers)`
   }
   return "◆ MP idle"
 }
