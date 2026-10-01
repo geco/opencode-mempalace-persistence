@@ -362,8 +362,8 @@ The plugin exports everything in the opencode database on the next sync, then re
 The plugin ships a second entry point, `tui.tsx`, that claims the sidebar footer:
 
 ```
-◆ MP mining 4/10 q8 w2/2 for 6m +1,240
-██████████▓▓▓░░░░░░░░░░░░░
+◆ MP mining 4/10 q8 w2/2 for 6m +1,240d
+[██████████▓▓▓░░░░░░░░░░░░░]
 ```
 
 Two lines. Line 1 is compact tokens: `◆` semaphore (green idle, blue mining, yellow queue/blocked, red error), `MP` tag, phase, files completed over files in the current wing (`4/10`, bare — the q- and w- prefixes mark the other counters), files queued live (`q8`), wing over wings (`w2/2`, always shown — `w1/1` confirms the run was scoped), elapsed of this run (`for 6m`), drawers gained (`+1,240d`, single-letter unit like the rest). Other states: `◆ MP queue q6 waiting 146h`, `◆ MP blocked q6 waiting 146h palace busy`, and idle with the last completed run (`◆ MP idle 9f 2w 25m ago (+1,240d)`, persisted across restarts — or plain `◆ MP idle` with no recorded run).

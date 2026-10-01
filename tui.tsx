@@ -198,7 +198,15 @@ const barLine = (s: Status, tick: number): string => {
     const head = Math.abs(tick) % GAUGE_MAX
     for (let i = 0; i < 3; i++) cells[(head + i) % GAUGE_MAX] = SWEEP
   }
-  return cells.join("")
+  // End caps, not full width, on purpose: the sidebar is 42 columns by
+  // default but clamps dynamically between 5 and 72 with the terminal
+  // (SESSION_SIDEBAR_WIDTH / clampSessionTabsWidth), and the plugin API
+  // exposes no element measurement — only terminal dimensions. Matching an
+  // exact width would mean reimplementing host layout logic that breaks
+  // across versions, and overshooting wraps and breaks the layout. The caps
+  // make fullness unambiguous at any width instead: a full bar touches both
+  // ends, which is what "is it full or not" actually needed.
+  return `[${cells.join("")}]`
 }
 
 const line1 = (s: Status, q: Queue): string => {
