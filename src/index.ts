@@ -1203,6 +1203,11 @@ function doDbSync(): void {
       const tail = remaining.total > 0 ? `, ${remaining.total} message(s) still waiting` : ", queue empty"
       toast("success", "MemPalace", `mined ${wingCount(wings)} session(s) → ${names}${detail}${tail}`)
       ilog("mine", { outcome: "ok", sessions: wingCount(wings), wings: [...wings.keys()], drawers: totalDrawers, remaining: remaining.total })
+      // Forced: stopMinePoll() above cleared the run's fields, and ilog's
+      // throttled write may drop. Without this the file keeps the last
+      // poll's mining fields forever (seen live: phase idle with wingIndex
+      // and mineStartedAt still set, because nothing ever rewrites it).
+      writeStatus(true)
       return
     }
     const wing = entries[i]
@@ -1259,6 +1264,9 @@ function doDbSync(): void {
           statusEvent("mine", { outcome: "busy", wing })
           log(`mine skipped, palace busy (${wing}) after ${attempt} retries — next trigger will retry`)
           ilog("mine", { outcome: "busy", wing })
+          // Forced, same reason as the done path: the throttled write may
+          // drop and the busy state would never reach the file.
+          writeStatus(true)
           return
         }
         errLog(`mine err (${wing}): ${msg}`)
