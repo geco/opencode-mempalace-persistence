@@ -102,6 +102,7 @@ function writeStatus(force = false): void {
         drawersNow: mineDrawersNow >= 0 ? mineDrawersNow : undefined,
         mineStartedAt: mineStartedAt || undefined,
         waiting: mineWaiting || undefined,
+        querying: statusQuery || undefined,
         fileIndex: mineFilesTotal > 0 ? mineFileIndex : undefined,
         filesTotal: mineFilesTotal > 0 ? mineFilesTotal : undefined,
         fileName: mineFileName || undefined,
@@ -655,6 +656,56 @@ function isMemPalaceTool(name: string): boolean {
   return typeof name === "string" && name.toLowerCase().includes("mempalace")
 }
 
+// Short display name: mcp__mempalace__mempalace_search -> search. The _+
+// quantifiers matter: real tool names use single underscores, but doubles
+// appear (double-stripped names used to come out as "_mempalace_search" and
+// silently miss every allowlist downstream).
+function shortToolName(name: string): string {
+  return String(name)
+    .replace(/^mcp_+/, "")
+    .replace(/^mempalace_+mempalace_+/, "")
+    .replace(/^mempalace_+/, "")
+}
+
+// Read tools whose invocation is worth showing live in the footer ("when is
+// the palace being queried"). Writes (diary_write, kg_add, checkpoint,
+// mine, tunnels…) are deliberately excluded: recording is not querying,
+// and the model's own archival writes would otherwise flicker the line
+// constantly. Tools with no text argument (status, list_wings…) return
+// null: there is nothing quotable to show, and they stay in interactions.log.
+const READ_TOOLS = new Set([
+  "search",
+  "diary_read",
+  "kg_query",
+  "kg_timeline",
+  "kg_stats",
+  "memories_filed_away",
+  "get_taxonomy",
+  "traverse_graph",
+  "find_tunnels",
+  "graph_stats",
+  "artifact_get",
+  "event_list",
+  "check_duplicate",
+  "get_aaak_spec",
+])
+
+function readQueryText(name: string, input: any): string | null {
+  if (!READ_TOOLS.has(name)) return null
+  const args = input?.args ?? input ?? {}
+  const raw = args.query ?? args.text ?? args.entity ?? args.question ?? args.content ?? null
+  if (typeof raw !== "string") return null
+  const clean = raw.replace(/\s+/g, " ").trim()
+  return clean ? clean.slice(0, 200) : null
+}
+
+// A query currently in flight, if any. Set by execute.before, cleared by
+// execute.after. Best-effort by nature: the footer polls every second, so a
+// sub-second query will rarely render mid-flight — but multi-second searches
+// (embedding + HNSW on one core) do. Overlaps resolve last-wins; a stale
+// line clears on the next completion either way.
+let statusQuery: { tool: string; text: string; startedAt: string } | null = null
+
 // MCP tool results arrive as content blocks ({content: [{type, text}]),
 // NOT as a flat `output` string (diagnosed via shape logging 2026-09-19:
 // keys=["content"], no `output` key at all).
@@ -675,7 +726,7 @@ function extractResultText(out: any): string {
 }
 
 function summarizeToolCall(tool: string, args: any, out: any): string {
-  const short = tool.replace(/^mcp_+/, "").replace(/^mempalace_mempalace_/, "").replace(/^mempalace_/, "")
+  const short = shortToolName(tool)
   let asked = ""
   try {
     const a = typeof args === "string" ? args : JSON.stringify(args || {})
@@ -1736,10 +1787,31 @@ async function server({ client }: any): Promise<any> {
       }
     },
 
+    "tool.execute.before": async (input: any) => {
+      // In-flight query flag for the footer. Must stay tiny: this runs
+      // synchronously inside every tool call, so memory set + one small
+      // forced JSON write, nothing else (no python, no readdir).
+      try {
+        const name = shortToolName((input as any)?.tool || "")
+        if (!isMemPalaceTool((input as any)?.tool || "")) return
+        const text = readQueryText(name, (input as any)?.args)
+        if (!text) return
+        statusQuery = { tool: name, text, startedAt: new Date().toISOString() }
+        writeStatus(true)
+      } catch {}
+    },
+
     "tool.execute.after": async (input: any, output: any) => {
       try {
         const name = (input as any)?.tool || ""
         if (!isMemPalaceTool(name)) return
+        // Clear any query line. Forced: the throttled ilog write below may
+        // drop (the before-hook just forced one), and a stuck "searching"
+        // line is worse than an extra tiny write per tool call.
+        if (statusQuery) {
+          statusQuery = null
+          writeStatus(true)
+        }
         const summary = summarizeToolCall(name, (input as any)?.args, output)
         log(`tool: ${summary}`)
         toast("info", "MemPalace", summary)
@@ -1747,7 +1819,7 @@ async function server({ client }: any): Promise<any> {
         // real shape once so extraction can be fixed (see answered-empty).
         const outAny = (output as any) || {}
         ilog("tool", {
-          tool: String(name).replace(/^mcp_+/, "").replace(/^mempalace_mempalace_/, "").replace(/^mempalace_/, ""),
+          tool: shortToolName(name),
           asked: (() => { try { return JSON.stringify((input as any)?.args || {}).replace(/\s+/g, " ").slice(0, 200) } catch { return "" } })(),
           answered: extractResultText(output).replace(/\s+/g, " ").slice(0, 300),
           shape: {
@@ -1852,12 +1924,30 @@ const mempalaceV2 = PluginV2.define({
       }
     })
 
+    // In-flight companion to the after-hook below. The ToolDomain API
+    // declares execute.before with { tool, sessionID, agent, messageID, id,
+    // input }; field access stays defensive because hosts vary.
+    await ctx.tool.hook("execute.before", (event: any) => {
+      try {
+        const raw = event?.tool || ""
+        if (!isMemPalaceTool(raw)) return
+        const text = readQueryText(shortToolName(raw), event?.input)
+        if (!text) return
+        statusQuery = { tool: shortToolName(raw), text, startedAt: new Date().toISOString() }
+        writeStatus(true)
+      } catch {}
+    })
+
     // Port of V1 "tool.execute.after": V2 delivers one event with
     // { tool, input, status, result | error } instead of (input, output).
     await ctx.tool.hook("execute.after", (event: any) => {
       try {
         const name = event?.tool || ""
         if (!isMemPalaceTool(name)) return
+        if (statusQuery) {
+          statusQuery = null
+          writeStatus(true)
+        }
         const out = event?.status === "completed"
           ? event?.result
           : { output: String(event?.error?.message || event?.error || "") }
@@ -1866,7 +1956,7 @@ const mempalaceV2 = PluginV2.define({
         toast("info", "MemPalace", summary)
         const outAny = (out as any) || {}
         ilog("tool", {
-          tool: String(name).replace(/^mcp_+/, "").replace(/^mempalace_mempalace_/, "").replace(/^mempalace_/, ""),
+          tool: shortToolName(name),
           asked: (() => { try { return JSON.stringify(event?.input || {}).replace(/\s+/g, " ").slice(0, 200) } catch { return "" } })(),
           answered: extractResultText(out).replace(/\s+/g, " ").slice(0, 300),
           shape: {

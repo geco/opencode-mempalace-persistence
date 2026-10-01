@@ -53,6 +53,7 @@ type Status = {
   fileFiled?: number
   fileTotal?: number | null
   lastRun?: { wings: number; files: number; drawers: number; at: string }
+  querying?: { tool: string; text: string; startedAt?: string }
 }
 
 const readStatus = (): Status => {
@@ -140,6 +141,24 @@ const span = (ms: number) => {
 // retries the phase stays "mining" with waiting=true instead.
 const working = (s: Status) => s.phase === "mining"
 const backlogged = (s: Status, q: Queue) => !working(s) && q.count > 0
+
+// Third line, rendered ONLY while a query is in flight, above the two
+// permanent lines. Format: ◇ MP searching "asdfasdf asdf .."
+//   ◇        hollow diamond: same family as the ◆ semaphore, hollow because
+//            this state is transient (a question, not a condition)
+//   18       max query chars, so the whole line stays within ~37 columns
+//            and never wraps: 16 of fixed tokens + 18 + 3 for ..". The
+//            sidebar is 42 wide by default but clamps 5..72, so like the
+//            bar this is safe, not exact — on very narrow layouts any long
+//            footer line wraps, this one is just the shortest of them.
+//   .."      dots inside the quotes, only when truncated.
+const QUERY_MAX = 18
+
+const queryLine = (qq: { tool: string; text: string }): string => {
+  const clean = qq.text.replace(/\s+/g, " ").trim()
+  const shown = clean.length > QUERY_MAX ? clean.slice(0, QUERY_MAX) + ".." : clean
+  return `◇ MP searching "${shown}"`
+}
 
 // Thousand grouping, done by hand: toLocaleString silently returns ungrouped
 // digits on runtimes without full ICU data (seen: "1240" instead of "1,240"),
@@ -302,7 +321,8 @@ export default {
     // One claim, one place: the sidebar footer. A compact mirror in the prompt
     // footer was tried and removed — two bars showing the same state read as
     // noise, and the prompt line is the most visually loaded area of the TUI.
-    // Two lines: the compact status tokens, then the true progress bar.
+    // Two permanent lines (status tokens, progress bar) plus the transient
+    // query line above them, rendered only while a search is in flight.
     const off = ctx.ui.slot({
       append: "sidebar.footer",
       render: () => {
@@ -310,6 +330,7 @@ export default {
         const q = queue()
         return (
           <box flexDirection="column" gap={0} flexShrink={0}>
+            {s.querying && <text fg={skin.accent}>{queryLine(s.querying)}</text>}
             <text fg={tone()}>{line1(s, q)}</text>
             <text fg={tone()}>{barLine(s, tick())}</text>
           </box>

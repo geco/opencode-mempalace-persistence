@@ -368,6 +368,14 @@ The plugin ships a second entry point, `tui.tsx`, that claims the sidebar footer
 
 Two lines. Line 1 is compact tokens: `◆` semaphore (green idle, blue mining, yellow queue/blocked, red error), `MP` tag, phase, files completed over files in the current wing (`4/10`, bare — the q- and w- prefixes mark the other counters), files queued live (`q8`), wing over wings (`w2/2`, always shown — `w1/1` confirms the run was scoped), elapsed of this run (`for 6m`), drawers gained (`+1,240d`, single-letter unit like the rest). Other states: `◆ MP queue q6 waiting 146h`, `◆ MP blocked q6 waiting 146h palace busy`, and idle with the last completed run (`◆ MP idle 9fl 2wn - 25m ago +1,240dr`, persisted across restarts — or plain `◆ MP idle` with no recorded run).
 
+A third line appears above them, only while a palace read is in flight:
+
+```
+◇ MP searching "asdfasdf asdf asdf.."
+```
+
+`◇` hollow diamond (same family as `◆`, hollow because transient), query text capped at 18 chars so the line stays within ~37 columns and never wraps (`..` inside the quotes, only when truncated). Driven by `execute.before`/`after` hooks around an explicit read-tool allowlist (`search`, `diary_read`, `kg_query`, …); writes are excluded on purpose (recording is not querying). The footer polls every second, so sub-second queries rarely render mid-flight — multi-second searches do. Mining keeps priority: a query never replaces the mining line.
+
 Line 2 is a REAL fraction — completed files over total files of the run, queued arrivals included — not a gauge. What the bar shows is **queue depth, not progress** is over: the old gauge filled with the queue and could never drain visually. A percentage was tried first and was wrong (`mempalace mine` is a black box: no total to divide by, so an animated 0→100 loop read as a job stuck at 99%). A fraction of files is exact; a percentage of "done" would be invented. The `▓▓▓` window sweeps while mining so a slow batch (minutes between commits) still looks alive. Idle the bar always sits empty — even with nothing queued, where a full bar read as garish: "done" is said by the idle line (last run summary below), and the accent-colored fill is then unmistakably the "executing" state.
 
 Per-FILE completion does not come from the mine: the miner walks the files silently (`for i, filepath in enumerate(files, 1)` — it knows, it just never says) and only the final summary reports. It comes from the palace instead: every filed drawer records its `source_file` plus the file's `chunk_total`, so intersecting the wing directory with the filed set tells exactly which files are done — with zero mine overhead. A read-only `COUNT(*)` plus one grouped metadata query, polled every 3s while a mine runs. Anything unreadable degrades to elapsed-time-only.
