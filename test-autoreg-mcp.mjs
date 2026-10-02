@@ -87,12 +87,29 @@ chmodSync(fakeBin, 0o755)
   check("enabled", entry?.enabled === true)
 }
 
-// 2. manual entry wins, even a writer one -----------------------------------
+// 2. manual entry: repaired, not just respected -------------------------------
 {
   const { registerMcpServer } = runWith({}, fakeHome)
-  const manual = { type: "local", command: ["mempalace-mcp"], enabled: true }
-  const { entry, reason } = registerMcpServer(manual, fakeBin)
-  check("manual entry untouched", entry === null, reason)
+  // 2a. writer entry without the env -> read-only added, command kept
+  const writer = { type: "local", command: [fakeBin], enabled: true }
+  const r1 = registerMcpServer(writer, fakeBin)
+  check(
+    "writer entry repaired (read-only added)",
+    !!r1.entry && r1.entry.environment?.MEMPALACE_MCP_READ_ONLY === "1",
+    r1.reason,
+  )
+  check("repair keeps working command", r1.entry?.command?.[0] === fakeBin)
+  check("repair keeps other keys", r1.entry?.type === "local" && r1.entry?.enabled === true)
+  // 2b. already-correct entry -> no churn
+  const r2 = registerMcpServer(r1.entry, fakeBin)
+  check("already-correct entry untouched", r2.entry === null, r2.reason)
+  // 2c. bare/broken command -> repointed to the working binary
+  const r3 = registerMcpServer({ type: "local", command: ["mempalace-mcp"], enabled: true }, fakeBin)
+  check("broken command repointed", r3.entry?.command?.[0] === fakeBin, r3.reason)
+  // 2d. opt-out -> fully untouched, even a writer
+  const { registerMcpServer: regOpt } = runWith({ MEMPALACE_MCP_MANUAL: "1" }, fakeHome)
+  const r4 = regOpt(writer, fakeBin)
+  check("MEMPALACE_MCP_MANUAL=1 skips repair", r4.entry === null, r4.reason)
 }
 
 // 3. no binary anywhere -> no entry, never a broken command -----------------

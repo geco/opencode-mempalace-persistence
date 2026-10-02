@@ -77,20 +77,23 @@ mempalace init ~/opencode-memory
 ```
 
 Then the MCP server — recall for the model — needs no configuration either.
-On startup the plugin registers it itself (same pattern as
-`nguyentamdat/opencode-mempalace`, via the `config` hook on v1 and
-`ctx.mcp.transform` on v2), but **read-only** (`MEMPALACE_MCP_READ_ONLY`):
-a writer MCP takes the palace lock for its whole lifetime and starves
-mining — with one tab occasionally, with two tabs (one MCP server each)
-as the rule. Reads never need the lock, so recall is unaffected; writes
-go through the bundled `mp-write.py` one-shots instead (synced to
+On startup the plugin ensures a correct `mempalace` entry exists (same
+pattern as `nguyentamdat/opencode-mempalace`, via the `config` hook on v1
+and `ctx.mcp.transform` on v2): missing entries are registered, present
+ones are **repaired** (broken command repointed to the working binary,
+read-only env added), custom keys (`cwd`, `timeout`, …) preserved. The
+file on disk is never rewritten — the correction applies in memory at
+load and is logged every time. To keep a hand-managed entry fully
+untouched (writer included), set `MEMPALACE_MCP_MANUAL=1` in the server
+environment.
+
+That entry is read-only (`MEMPALACE_MCP_READ_ONLY`): a writer MCP takes
+the palace lock for its whole lifetime and starves mining — with one tab
+occasionally, with two tabs (one MCP server each) as the rule. Reads
+never need the lock, so recall is unaffected; writes go through the
+bundled `mp-write.py` one-shots instead (synced to
 `~/.mempalace/mp-write.py` on startup, same functions the MCP server
 calls, seconds-long processes).
-
-If you already have a `mempalace` entry in `opencode.jsonc`, yours wins
-and nothing is registered — including a writer entry, if you know what
-you are doing. To go back to manual wiring, define the entry yourself;
-to force the binary location, set `MEMPALACE_MCP_BIN`.
 
 Restart OpenCode after editing.
 
@@ -184,9 +187,10 @@ wiring instead, add it explicitly:
     "type": "local",
     "command": ["/home/YOU/.local/bin/mempalace-mcp"],
     "enabled": true
-    // NOTE: without "environment": {"MEMPALACE_MCP_READ_ONLY": "1"} this is
-    // a WRITER: it holds the palace lock for the session lifetime and idle
-    // mines will wait behind it (with two tabs, almost always).
+    // NOTE: at load the plugin repairs this entry (working binary +
+    // read-only env) unless MEMPALACE_MCP_MANUAL=1 is set — see §3.
+    // A bare writer entry holds the palace lock for the session lifetime
+    // and idle mines will wait behind it (with two tabs, almost always).
   }
 }
 ```
@@ -494,8 +498,8 @@ private files — with the setup and write posture changed:
   the skill and this README point at `mp-write.py`.
 
 If you relied on MCP writes (diary/KG via MCP tools), move them to
-`mp-write.py` — same functions, same results. To keep a writer MCP
-instead, define the entry manually (see §3): yours wins.
+`mp-write.py` — same functions, same results. To keep a fully hand-managed
+entry instead, set `MEMPALACE_MCP_MANUAL=1` (see §3).
 
 ### What 3.0.0 changed (and why it's a major)
 

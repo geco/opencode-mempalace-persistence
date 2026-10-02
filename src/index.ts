@@ -629,17 +629,52 @@ function mcpServerEntry(bin: string): Record<string, unknown> {
   }
 }
 
-// Shared by the V1 `config` hook and the V2 `ctx.mcp.transform` below:
-// inject only when the user has no mempalace entry of their own. A manual
-// entry always wins — including a writer one (no read-only env), for users
-// who know what they are doing.
+// Shared by the V1 `config` hook and the V2 `ctx.mcp.transform` below.
+// Zero-config means owned-config: a missing entry is injected, a present
+// one is REPAIRED to the correct shape (working binary + read-only env).
+// The file on disk is never rewritten — the correction applies in memory
+// at load and is logged every time, so it stays visible, not magic.
+// Escape hatch: MEMPALACE_MCP_MANUAL=1 leaves any manual entry fully
+// untouched (writer loyalists included).
 function registerMcpServer(
-  existing: unknown,
+  existing: any,
   bin: string,
 ): { entry: Record<string, unknown> | null; reason: string } {
-  if (existing) return { entry: null, reason: "manual mempalace MCP entry present, respected" }
-  if (!bin) return { entry: null, reason: "mempalace-mcp binary not found, skipping registration" }
-  return { entry: mcpServerEntry(bin), reason: `registered read-only mempalace MCP (${bin})` }
+  if (
+    ["1", "true", "yes", "on"].includes(
+      String(process.env.MEMPALACE_MCP_MANUAL || "").trim().toLowerCase(),
+    )
+  )
+    return { entry: null, reason: "MEMPALACE_MCP_MANUAL=1, manual entry untouched" }
+  if (!existing) {
+    if (!bin) return { entry: null, reason: "mempalace-mcp binary not found, skipping registration" }
+    return { entry: mcpServerEntry(bin), reason: `registered read-only mempalace MCP (${bin})` }
+  }
+  // Repair: copy, fix what is broken, keep the rest (custom cwd, timeout…).
+  const fixed: Record<string, unknown> = { ...(existing as Record<string, unknown>) }
+  const repairs: string[] = []
+  const cmd = Array.isArray((existing as any)?.command) ? (existing as any).command : null
+  if (!cmd || typeof cmd[0] !== "string" || !cmd[0]) {
+    if (bin) {
+      fixed.command = [bin]
+      repairs.push("command set")
+    }
+  } else {
+    try {
+      if (!existsSync(cmd[0]) && bin && cmd[0] !== bin) {
+        fixed.command = [bin, ...cmd.slice(1)]
+        repairs.push("command repointed to working binary")
+      }
+    } catch {}
+  }
+  const env = { ...((existing as any)?.environment || {}) }
+  if (env.MEMPALACE_MCP_READ_ONLY !== "1") {
+    env.MEMPALACE_MCP_READ_ONLY = "1"
+    repairs.push("read-only enforced")
+  }
+  fixed.environment = env
+  if (repairs.length === 0) return { entry: null, reason: "manual entry already correct" }
+  return { entry: fixed, reason: `repaired manual entry (${repairs.join(", ")})` }
 }
 
 function hasText(parts: any[]): string {
