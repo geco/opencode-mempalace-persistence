@@ -439,6 +439,16 @@ OpenCode resolves npm plugins **once** and caches them. A new version of this pl
 
 Check what is actually loaded with `opencode plugin list`.
 
+### What 3.0.0 changed (and why it's a major)
+
+Same guarantees as before — local-only, zero extra AI calls, verbatim messages, private files — with three behavioural changes worth reading before upgrading:
+
+- **Export filenames are content-addressed**: `sync_<session8>_<sha256-prefix>.txt` instead of `sync_<date>_<title>_<session>.txt`. The date and title used to be part of the name, so the same conversation exported twice produced two different files with identical content. Each file also ends with an `mp-ids` trailer listing the message ids it carries, which is what dedup now keys on. Files exported by 2.x are still mined — the mine scans by `*.txt` — they just keep their old names until they are consumed.
+- **Dedup is derived from the queue, not from `exported_ids`.** Deleting an export file immediately frees its messages again, instead of the plugin believing they are already filed because a stale set says so.
+- **The TUI sidebar footer is new**: two permanent lines (compact status tokens + a true run-fraction bar) plus a query row that shows a palace read in flight and, when idle, the last one. It only reads a small status file the server already writes; it never triggers work.
+
+Mining is still manual: mempalace runs when OpenCode goes idle, at startup and at exit — never in the middle of your work.
+
 ---
 
 ## Install from npm
