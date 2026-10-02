@@ -12,6 +12,7 @@
     "dist",
     "tui.tsx",
     "mine-detached.sh",
+    "mp-write.py",
     "skills"
   ],
   "scripts": {
