@@ -22,7 +22,10 @@ Follows the official MemPalace automation pattern (same as the Claude Code hooks
 | You repeat context each time | Memory is automatic |
 | Model starts from scratch each time | Memory persists across sessions |
 
-The plugin injects relevant memories from MemPalace into every prompt (via `experimental.chat.messages.transform`), and saves every response back to MemPalace. A perfect feedback loop.
+The plugin saves every completed turn to MemPalace (mined on idle, exit
+and startup) and gives the model recall (question-driven search via the
+bundled skill and MCP reads, or injected identity + memories with
+`autoInjectContext`). A feedback loop with no extra AI calls.
 
 ---
 
@@ -194,7 +197,6 @@ wiring instead, add it explicitly:
   }
 }
 ```
-```
 
 > Note: `identity.txt` is NOT listed in `instructions` — the plugin injects it automatically. It is also NOT in the `provider` block or `permission` block — those are optional and depend on your model setup.
 
@@ -222,30 +224,37 @@ No AGENTS.md changes needed beyond the minimal block above.
 You ask a question
   → Plugin hooks into `experimental.chat.messages.transform`
   → Injects your identity + relevant memories from MemPalace
+    (when autoInjectContext is on; otherwise recall is question-driven
+    via the bundled skill and MCP reads)
   → Every ~15 messages: injects a [MemPalace Checkpoint] block
-  → Model files topics/decisions/quotes via MCP tools, then answers
+  → Model files topics/decisions/quotes via ~/.mempalace/mp-write.py,
+    then answers
 
 The model responds
   → Once the turn completes, the next idle/exit/startup mines it to MemPalace (flat export, no hardcoded wings)
-  → Model records new KG facts via MCP tools (only when something new emerged)
+  → Model records new KG facts via mp-write.py (only when something new emerged)
 
 Session goes idle / process exits
   → Background mine of everything new since last sync (per-wing cursors:
   each wing advances independently, so one slow wing never stalls the rest)
   → TUI toast confirms what was mined (disable with `"toasts": false`)
 
-Every MemPalace call — plugin searches, model MCP calls (search, diary,
+Every MemPalace call — plugin searches, model MCP reads (search, diary_read,
 KG) — also raises a short TUI toast with what was asked and a result
 preview, so background memory activity is always visible. A startup toast
-shows the loaded plugin version (`plugin v2.x loaded`), so you always know
+shows the loaded plugin version (`opencode-mempalace-persistence v4.0.0
+loaded`, with pending backlog when there is one), so you always know
 whether you're running the npm release or a local build.
 
-Multiple opencode instances are supported: mines coordinate through the
-palace lock with backoff-and-retry (up to ~10min per wing), so concurrent
-instances interleave wing by wing instead of starving each other — backfills
-complete even with two sessions open. Routine contention shows one info
-toast every 5 minutes max. To reduce contention during huge backfills, a
-single instance is still fastest.
+Lock contention is a solved problem, not a state to manage. The MCP
+servers the plugin registers are read-only, so they never hold the palace
+lock; the only writers are short-lived processes (CLI mines, mp-write.py
+one-shots), which serialize through the lock in seconds. Two tabs mean
+two readers, not two contenders — the tab starvation that motivated v4
+cannot happen. A leftover writer MCP (manual entry, or a dying server
+releasing the flock) is the only remaining source of `wait`, and it
+resolves on its own: in-session mines retry with backoff, exit mines
+retry for 30 minutes.
 
 Compaction starts
   → [MemPalace Pre-Compact Emergency Save]: model files everything first
@@ -260,7 +269,7 @@ Next time you ask
 
 ## What gets saved
 
-Every turn (question + answer) is saved as a drawer in MemPalace. Mining runs with `--mode convos` (default `exchange` extraction: one drawer per exchange pair, verbatim, no paraphrasing). Exports are grouped one wing per project (official multi-project pattern: `bot-oc` sessions land in wing `bot-oc`, never leaking across projects). Only completed turns are exported (in-flight replies are revisited by the next sync). The model additionally records KG facts (decisions, milestones, preferences) during conversation and at each checkpoint via MCP tools.
+Every turn (question + answer) is saved as a drawer in MemPalace. Mining runs with `--mode convos` (default `exchange` extraction: one drawer per exchange pair, verbatim, no paraphrasing). Exports are grouped one wing per project (official multi-project pattern: `bot-oc` sessions land in wing `bot-oc`, never leaking across projects). Only completed turns are exported (in-flight replies are revisited by the next sync). The model additionally records KG facts (decisions, milestones, preferences) during conversation and at each checkpoint via `mp-write.py`.
 
 ### Message-level dedup
 
@@ -330,7 +339,7 @@ The plugin exports everything in the opencode database on the next sync, then re
 - **Drawers** (transcripts) are append-mostly: a crash mid-mine can only leave already-filed content behind, never corrupt what's stored. Re-running the mine is always safe.
 - **KG facts** live a different life: `kg_supersede` replaces a fact atomically at a shared boundary (single transaction) — a mid-write crash rolls back to the *old* fact: stale but present, never half-written.
 - **Reads are validity-window only**: there is no liveness check on read, so a stale fact reads as current until the model revisits it (via checkpoint, diary review, or a new decision on the same subject).
-- **Backfill mines transcripts into drawers only** — it never touches the KG. KG facts come exclusively from live MCP calls (conversation, checkpoints, diary). A crashed supersede therefore waits for the next model touch, not the next backfill.
+- **Backfill mines transcripts into drawers only** — it never touches the KG. KG facts come exclusively from live `mp-write.py` calls (conversation, checkpoints, diary). A crashed supersede therefore waits for the next model touch, not the next backfill.
 
 ---
 
@@ -368,11 +377,16 @@ The plugin exports everything in the opencode database on the next sync, then re
                             ▲
                             │
                  ┌──────────────────────────┐
-                 │  Model (via AGENTS.md)    │
-                 │  Records KG facts:       │
-                 │  kg_add / kg_invalidate  │
+                 │  Model writes via           │
+                 │  ~/.mempalace/mp-write.py │
+                 │  diary / kg-* / add-drawer│
                  └──────────────────────────┘
 ```
+
+Reads (search, diary_read, kg_query) go through the MCP server, which
+the plugin auto-registers read-only (repaired if you have your own
+entry): readers never hold the palace lock, so two tabs mean two
+readers, not two contenders. See §3.
 
 ---
 
@@ -380,8 +394,9 @@ The plugin exports everything in the opencode database on the next sync, then re
 
 | File | Purpose |
 |---|---|
-| `~/.config/opencode/opencode.json` | OpenCode config with plugin + MCP |
-| `~/.config/opencode/AGENTS.md` | Tells the model to manage KG facts |
+| `~/.config/opencode/opencode.json` | Plugin entry (MCP auto-registered read-only, repaired if present) |
+| `~/.config/opencode/AGENTS.md` | Tells the model to manage KG facts via `mp-write.py` |
+| `~/.mempalace/mp-write.py` | One-shot writer (synced from the package on startup): diary, kg-*, add-drawer |
 | `~/.mempalace/plugin-config.json` | Plugin config (`autoInjectContext`, `saveInterval`, `toasts` — all optional, see §4) |
 | `~/.config/opencode/skills/mempalace-recall/SKILL.md` | Bundled recall skill (copy from `skills/` in this repo) |
 | `~/.mempalace/identity.txt` | Your identity (injected by plugin) |
@@ -483,9 +498,11 @@ Check what is actually loaded with `opencode plugin list`.
 Same guarantees — local-only, zero extra AI calls, verbatim messages,
 private files — with the setup and write posture changed:
 
-- **Zero-config MCP.** The plugin registers its own `mempalace` server
-  entry on startup (`config` hook on v1, `ctx.mcp.transform` on v2) when
-  you have none. No `mcp` block to write. A manual entry always wins.
+- **Zero-config MCP.** The plugin ensures a correct `mempalace` server
+  entry on startup (`config` hook on v1, `ctx.mcp.transform` on v2):
+  missing entries are registered, present ones repaired (working binary
+  + read-only env, custom keys kept, disk file never rewritten —
+  `MEMPALACE_MCP_MANUAL=1` opts out). No `mcp` block to write.
 - **That entry is read-only** (`MEMPALACE_MCP_READ_ONLY`). A writer MCP
   takes the palace lock for its whole lifetime and starves CLI mines —
   with one tab occasionally, with two tabs (one MCP server each) as the
@@ -548,7 +565,7 @@ history on demand, never polluting session context:
   results and errors, armed checkpoints, and every MemPalace call
   (plugin searches and model MCP calls) with what was asked plus a
   short answer preview. A startup toast shows the loaded build
-  (`opencode-mempalace-persistence v2.x loaded`), so npm-cache vs
+  (`opencode-mempalace-persistence v4.0.0 loaded`), so npm-cache vs
   local build is never a mystery. *(Silent on OpenCode v2 — its server
   runtime has no toast surface; use `/memory-log` there.)*
 - **`/memory-status`** — palace health in the transcript: drawers,
@@ -556,7 +573,8 @@ history on demand, never polluting session context:
   explanations, active config. Read-only.
 - **`/memory-log [N] [filter]`** — the interaction history: every
   search (query → result count), tool call (asked → answered preview),
-  mine (outcome per wing) and checkpoint, newest last. Backed by
+  mine (outcome per wing), checkpoint and MCP auto-register repair,
+  newest last. Backed by
   `~/.mempalace/hook_state/interactions.log` (JSON lines, auto-rotated).
   Read-only.
 
