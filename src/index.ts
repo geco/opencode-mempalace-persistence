@@ -1582,7 +1582,10 @@ function doDbSync(): void {
         if (/is held by/i.test(msg)) {
           statusPhase = "busy"
           statusWing = wing
-          const holder = mineBlockedBy
+          // Parse the holder from THIS failure, not the stale field: the
+          // field is cleared at every attempt start, so on the terminal
+          // failure it is always null and the give-up was logged holderless.
+          const holder = shortHolder(msg) || mineBlockedBy
           stopMinePoll()
           statusEvent("mine", { outcome: "busy", wing })
           log(`mine skipped, palace busy (${wing}) after ${attempt} retries — next trigger will retry`)

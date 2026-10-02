@@ -256,17 +256,17 @@ const line1 = (s: Status, q: Queue): string => {
       typeof s.wingsTotal === "number" && s.wingsTotal > 0 ? ` w${(s.wingIndex ?? 0) + 1}/${s.wingsTotal}` : ""
     // Reached only when NOT waiting (waiting returns below): the full
     // detail line with live counters.
-    // While waiting with a known holder, the holder displaces everything
-    // frozen: file counter, queue depth and drawer delta do not move during
-    // backoff, so they cost width for zero information. What moves is the
-    // clock, and what matters is who to close. "by mcp:950803" says it.
-    // Width-budgeted: the full detail line returns when unblocked.
+    // While waiting, frozen counters drop out: file/queue/drawer numbers do
+    // not move during backoff, so they cost width for zero information. Only
+    // the clock stays, plus the single word "waiting". The holder (who holds
+    // the lock) is deliberately NOT shown: a pid is unactionable on a
+    // transient holder (a mine finishing in seconds) and stale on a stuck
+    // one — it lives in interactions.log (`/memory-log`) where it belongs.
     if (s.waiting) {
       const since = s.mineStartedAt ? Date.parse(s.mineStartedAt) : 0
       const wing =
         typeof s.wingsTotal === "number" && s.wingsTotal > 0 ? ` w${(s.wingIndex ?? 0) + 1}/${s.wingsTotal}` : ""
-      const holder = s.blockedBy ? ` by ${s.blockedBy}` : ""
-      return `◆ MP mining${wing} ${since ? span(since) : "just started"} wait${holder}`
+      return `◆ MP mining${wing} ${since ? span(since) : "just started"} waiting`
     }
     let grown = ""
     if (
