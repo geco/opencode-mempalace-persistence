@@ -37,19 +37,25 @@ question-driven, not reflexive — a search on every turn wastes latency.
 3. Return the drawer's **verbatim** text. Never summarize or paraphrase
    stored content — quoting the exact words is the point of the system.
 4. After a substantive session, record continuity with
-   `mempalace_diary_write` (skip if a checkpoint hook already saved).
-5. File durable outcomes with `mempalace_add_drawer`; new KG facts with
-   `mempalace_kg_add` (128 chars or fewer); single-valued replacements
-   with `mempalace_kg_supersede`; ended facts with
-   `mempalace_kg_invalidate`.
+   `~/.mempalace/mp-write.py diary --agent <name> --topic <topic> --entry <text>`
+   (skip if a checkpoint hook already saved). The MCP tools are read-only by
+   design — mp-write.py is the write path (same functions, seconds-long
+   processes, lock released on exit).
+5. File durable outcomes with `mp-write.py add-drawer --wing <w> --room <r> --content <text>`;
+   new KG facts with `mp-write.py kg-add --subject <s> --predicate <p> --object <o>`
+   (128 chars or fewer); single-valued replacements with `mp-write.py kg-supersede
+   --subject <s> --predicate <p> --old <o> --new <n>`; ended facts with
+   `mp-write.py kg-invalidate --subject <s> --predicate <p> --object <o>`.
 
 ## Tool names in OpenCode
 
-When the MCP server is registered in OpenCode as `mempalace`, every
-tool carries a double prefix: `mempalace_mempalace_search`,
-`mempalace_mempalace_kg_query`, `mempalace_mempalace_diary_write`, and
-so on. (In Claude Code the same tools have a single `mempalace_`
-prefix.)
+Reads go through the MCP server (registered in OpenCode as `mempalace`, so
+every tool carries a double prefix: `mempalace_mempalace_search`,
+`mempalace_mempalace_kg_query`, `mempalace_mempalace_diary_read`, and
+so on — in Claude Code the same tools have a single `mempalace_`
+prefix). Writes go through `~/.mempalace/mp-write.py` instead: the MCP
+server is read-only on purpose (a writer would hold the palace lock for
+the whole session and starve mining).
 
 ## Unhappy paths
 

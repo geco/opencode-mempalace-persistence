@@ -28,6 +28,8 @@ The plugin injects relevant memories from MemPalace into every prompt (via `expe
 
 ## Installation
 
+Zero-config: install the plugin and the palace, nothing else to wire.
+
 ### 1. Plugin (saves conversations)
 
 ```json
@@ -74,28 +76,23 @@ pipx install "mempalace>=3.3.5"
 mempalace init ~/opencode-memory
 ```
 
-Then register the MCP server in `~/.config/opencode/opencode.jsonc` — this is
-what gives the model recall (search, diary reads, knowledge-graph queries).
-The plugin itself only mines via the CLI; without this block there is no
-recall. Note: `mempalace mcp` prints setup commands for Claude Code and Codex
-only, **not** for OpenCode — use this block instead:
+Then the MCP server — recall for the model — needs no configuration either.
+On startup the plugin registers it itself (same pattern as
+`nguyentamdat/opencode-mempalace`, via the `config` hook on v1 and
+`ctx.mcp.transform` on v2), but **read-only** (`MEMPALACE_MCP_READ_ONLY`):
+a writer MCP takes the palace lock for its whole lifetime and starves
+mining — with one tab occasionally, with two tabs (one MCP server each)
+as the rule. Reads never need the lock, so recall is unaffected; writes
+go through the bundled `mp-write.py` one-shots instead (synced to
+`~/.mempalace/mp-write.py` on startup, same functions the MCP server
+calls, seconds-long processes).
 
-```jsonc
-{
-  "plugin": ["opencode-mempalace-persistence"],
-  "mcp": {
-    "mempalace": {
-      "type": "local",
-      "command": ["/home/YOU/.local/bin/mempalace-mcp"],
-      "enabled": true
-    }
-  }
-}
-```
+If you already have a `mempalace` entry in `opencode.jsonc`, yours wins
+and nothing is registered — including a writer entry, if you know what
+you are doing. To go back to manual wiring, define the entry yourself;
+to force the binary location, set `MEMPALACE_MCP_BIN`.
 
-Replace `/home/YOU/.local/bin/mempalace-mcp` with the real path (`which
-mempalace-mcp` — with `uv tool` or `pipx` it is usually
-`~/.local/bin/mempalace-mcp`). Restart OpenCode after editing.
+Restart OpenCode after editing.
 
 ### 4. Plugin config (all optional)
 
@@ -141,21 +138,30 @@ verbatim, never paraphrase.
 
 ## Record facts (after responding, only when something new emerged)
 
+Writes go through `~/.mempalace/mp-write.py` (the MCP server is read-only
+by design — see §3):
+
 - Durable outcomes (decisions, conclusions, learned facts):
-  `mempalace_mempalace_add_drawer`.
-- New KG facts: `mempalace_mempalace_kg_add` (128 chars or fewer).
-- Changed single-valued fact: `mempalace_mempalace_kg_supersede`.
-- Ended fact: `mempalace_mempalace_kg_invalidate`.
+  `mp-write.py add-drawer --wing <w> --room <r> --content <text>`.
+- New KG facts: `mp-write.py kg-add --subject <s> --predicate <p> --object <o>`
+  (128 chars or fewer).
+- Changed single-valued fact:
+  `mp-write.py kg-supersede --subject <s> --predicate <p> --old <o> --new <n>`.
+- Ended fact: `mp-write.py kg-invalidate --subject <s> --predicate <p> --object <o>`.
+- Session journal:
+  `mp-write.py diary --agent <name> --topic <topic> --entry <text>`.
 
 Record facts you are confident about. Prefer quality over quantity;
 noisy entries degrade retrieval over time. Don't file secrets or tokens.
 
 ### Naming reminder
-All MemPalace tools use the prefix `mempalace_mempalace_*` (not `mempalace_*`). Examples:
+Reads use the prefix `mempalace_mempalace_*` (not `mempalace_*`). Examples:
 - `mempalace_mempalace_search` (NOT `mempalace_search`)
 - `mempalace_mempalace_kg_query`
-- `mempalace_mempalace_kg_add`
+- `mempalace_mempalace_diary_read`
 If you ever catch yourself typing `mempalace_search`, STOP — the correct prefix is `mempalace_mempalace_`.
+Writes do NOT go through MCP tools (`..._diary_write`, `..._kg_add` are
+refused: the server is read-only) — they go through `mp-write.py` above.
 ```
 
 #### Complete `~/.config/opencode/opencode.json`
@@ -164,15 +170,26 @@ If you ever catch yourself typing `mempalace_search`, STOP — the correct prefi
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": ["opencode-mempalace-persistence"],
-  "instructions": ["AGENTS.md"],
-  "mcp": {
-    "mempalace": {
-      "type": "local",
-      "command": ["mempalace-mcp"],
-      "enabled": true
-    }
+  "instructions": ["AGENTS.md"]
+}
+```
+
+No `mcp` block needed: the plugin registers its own read-only entry on
+startup (manual entries still win — see §3). If you want the old manual
+wiring instead, add it explicitly:
+
+```jsonc
+"mcp": {
+  "mempalace": {
+    "type": "local",
+    "command": ["/home/YOU/.local/bin/mempalace-mcp"],
+    "enabled": true
+    // NOTE: without "environment": {"MEMPALACE_MCP_READ_ONLY": "1"} this is
+    // a WRITER: it holds the palace lock for the session lifetime and idle
+    // mines will wait behind it (with two tabs, almost always).
   }
 }
+```
 ```
 
 > Note: `identity.txt` is NOT listed in `instructions` — the plugin injects it automatically. It is also NOT in the `provider` block or `permission` block — those are optional and depend on your model setup.
@@ -456,6 +473,29 @@ OpenCode resolves npm plugins **once** and caches them. A new version of this pl
 - `rm -rf ~/.cache/opencode/npm/opencode-mempalace-persistence@latest` and restart.
 
 Check what is actually loaded with `opencode plugin list`.
+
+### What 4.0.0 changed (and why it's a major)
+
+Same guarantees — local-only, zero extra AI calls, verbatim messages,
+private files — with the setup and write posture changed:
+
+- **Zero-config MCP.** The plugin registers its own `mempalace` server
+  entry on startup (`config` hook on v1, `ctx.mcp.transform` on v2) when
+  you have none. No `mcp` block to write. A manual entry always wins.
+- **That entry is read-only** (`MEMPALACE_MCP_READ_ONLY`). A writer MCP
+  takes the palace lock for its whole lifetime and starves CLI mines —
+  with one tab occasionally, with two tabs (one MCP server each) as the
+  rule. Reads never need the lock, so recall is unaffected.
+- **Writes go through `mp-write.py`** (synced to `~/.mempalace/mp-write.py`
+  on startup): `diary`, `kg-add`, `kg-supersede`, `kg-invalidate`,
+  `add-drawer` — the same tool functions the MCP server calls, in
+  seconds-long processes. The MCP `..._diary_write` / `..._kg_add` tools
+  are refused by design now; checkpoint and pre-compact instructions,
+  the skill and this README point at `mp-write.py`.
+
+If you relied on MCP writes (diary/KG via MCP tools), move them to
+`mp-write.py` — same functions, same results. To keep a writer MCP
+instead, define the entry manually (see §3): yours wins.
 
 ### What 3.0.0 changed (and why it's a major)
 

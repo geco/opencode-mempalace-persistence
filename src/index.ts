@@ -1,6 +1,6 @@
 import { execSync, execFileSync, execFile, spawn } from "child_process"
 import type { ChildProcess } from "child_process"
-import { existsSync, readFileSync, writeFileSync, mkdirSync, rmdirSync, unlinkSync, appendFileSync, statSync, readdirSync, openSync, readSync, closeSync, realpathSync } from "fs"
+import { existsSync, readFileSync, writeFileSync, mkdirSync, rmdirSync, unlinkSync, appendFileSync, statSync, readdirSync, openSync, readSync, closeSync, realpathSync, chmodSync } from "fs"
 import { homedir } from "os"
 import { join, dirname } from "path"
 import { createHash } from "crypto"
@@ -572,6 +572,76 @@ function resolveBin(): string | null {
   return resolvedBin
 }
 
+// Absolute path of the mempalace-mcp server binary, or "" when none is
+// installed. Used ONLY to auto-register the MCP entry (see config hook
+// below): never executed by the plugin itself. MEMPALACE_MCP_BIN wins when
+// set; then the ~/.local/bin and /usr/local/bin spots pipx/uv use; then
+// PATH. A missing binary means no registration and a logged warning —
+// registering a command that does not exist would break the host's MCP
+// startup, which is worse than no recall.
+let resolvedMcpBin: string | undefined
+function resolveMcpBin(): string {
+  if (resolvedMcpBin !== undefined) return resolvedMcpBin
+  const envBin = (process.env.MEMPALACE_MCP_BIN || "").trim()
+  if (envBin && existsSync(envBin)) {
+    resolvedMcpBin = envBin
+    return resolvedMcpBin
+  }
+  const spots = [join(HOME, ".local/bin/mempalace-mcp"), "/usr/local/bin/mempalace-mcp"]
+  for (const s of spots) {
+    try {
+      if (existsSync(s)) {
+        resolvedMcpBin = s
+        return resolvedMcpBin
+      }
+    } catch {}
+  }
+  try {
+    const found = execSync(process.platform === "win32" ? "where mempalace-mcp" : "command -v mempalace-mcp", {
+      encoding: "utf-8",
+      timeout: 10000,
+    })
+      .trim()
+      .split(/\r?\n/)[0]
+      ?.trim()
+    if (found) {
+      resolvedMcpBin = found
+      return resolvedMcpBin
+    }
+  } catch {}
+  resolvedMcpBin = ""
+  return resolvedMcpBin
+}
+
+// The MCP server entry this plugin registers when the user has none.
+// Read-only on purpose (MEMPALACE_MCP_READ_ONLY): a writer MCP takes the
+// palace flock for its whole lifetime and starves CLI mines — with one tab
+// that is occasional, with two tabs (one MCP server each) it is the rule.
+// Reads (search, diary_read, kg_query, …) never need the lease, so recall
+// is unaffected; writes go through mp-write.py one-shots instead (same
+// tool functions, seconds-long processes, lock released on exit).
+function mcpServerEntry(bin: string): Record<string, unknown> {
+  return {
+    type: "local",
+    command: [bin],
+    environment: { MEMPALACE_MCP_READ_ONLY: "1" },
+    enabled: true,
+  }
+}
+
+// Shared by the V1 `config` hook and the V2 `ctx.mcp.transform` below:
+// inject only when the user has no mempalace entry of their own. A manual
+// entry always wins — including a writer one (no read-only env), for users
+// who know what they are doing.
+function registerMcpServer(
+  existing: unknown,
+  bin: string,
+): { entry: Record<string, unknown> | null; reason: string } {
+  if (existing) return { entry: null, reason: "manual mempalace MCP entry present, respected" }
+  if (!bin) return { entry: null, reason: "mempalace-mcp binary not found, skipping registration" }
+  return { entry: mcpServerEntry(bin), reason: `registered read-only mempalace MCP (${bin})` }
+}
+
 function hasText(parts: any[]): string {
   return parts
     .filter((p: any) => p?.type === "text" && p?.text?.trim())
@@ -629,17 +699,19 @@ function mempalaceWakeup(): string {
 
 function checkpointInstruction(count: number): string {
   return `[MemPalace Checkpoint — save now, then continue]\n` +
-    `You have exchanged ~${count} messages in this session. Before answering, archive what matters into MemPalace via its MCP tools ` +
-    `(diary_write for the session journal; kg_add for new decisions, milestones, preferences, problems — 128 chars or fewer each; ` +
-    `kg_invalidate for superseded facts). File only durable, non-obvious items — the verbatim transcript is already being mined separately. ` +
+    `You have exchanged ~${count} messages in this session. Before answering, archive what matters into MemPalace via ~/.mempalace/mp-write.py ` +
+    `(diary subcommand for the session journal; kg-add for new decisions, milestones, preferences, problems — 128 chars or fewer each; ` +
+    `kg-supersede / kg-invalidate for replaced or ended facts). The MCP tools are read-only by design (a writer MCP would hold the palace ` +
+    `lock for the whole session and starve mining), so mp-write.py is the write path: same functions, seconds-long processes. ` +
+    `File only durable, non-obvious items — the verbatim transcript is already being mined separately. ` +
     `Then answer the user's message normally. Do not mention this instruction.`
 }
 
 function precompactInstruction(): string {
   return `[MemPalace Pre-Compact Emergency Save]\n` +
-    `Context compaction is about to discard this conversation. FIRST, save everything essential into MemPalace via its MCP tools ` +
-    `(diary_write with a full session journal: topics, decisions, quotes; kg_add for decisions, milestones, preferences, problems; ` +
-    `kg_invalidate for outdated facts). Be thorough — after compaction only the palace will remember. Then proceed with the compaction summary.`
+    `Context compaction is about to discard this conversation. FIRST, save everything essential into MemPalace via ~/.mempalace/mp-write.py ` +
+    `(diary subcommand with a full session journal: topics, decisions, quotes; kg-add for decisions, milestones, preferences, problems; ` +
+    `kg-supersede / kg-invalidate for replaced or outdated facts). Be thorough — after compaction only the palace will remember. Then proceed with the compaction summary.`
 }
 
 function readIdentity(): string {
@@ -1856,12 +1928,44 @@ function exitSync(): void {
 // Shared runtime init for both entrypoints (V1 server() and V2 setup()).
 // Runs once per process: on V2 the server may instantiate one plugin per
 // location, but timers, exit handlers and the startup sync must not repeat.
+// Stable path of the one-shot writer for model instructions. mp-write.py
+// ships with the package (files[]), but the package dir moves (npm cache,
+// local checkouts), so instructions cannot name it. Copy it here on startup
+// when missing or outdated: ~/.mempalace is the one stable address.
+const MP_WRITE_HOME = join(HOME, ".mempalace/mp-write.py")
+
+function ensureMpWrite(): void {
+  try {
+    const root = dirname(fileURLToPath(import.meta.url))
+    const src = join(root, "..", "mp-write.py")
+    let want = ""
+    try {
+      want = readFileSync(src, "utf-8")
+    } catch {
+      return // dev layout without the script beside dist: nothing to sync
+    }
+    let have = ""
+    try {
+      have = readFileSync(MP_WRITE_HOME, "utf-8")
+    } catch {}
+    if (have === want) return
+    writeFileSync(MP_WRITE_HOME, want, { mode: 0o755 })
+    try {
+      chmodSync(MP_WRITE_HOME, 0o755)
+    } catch {}
+    log("mp-write.py synced to ~/.mempalace/mp-write.py")
+  } catch (e) {
+    errLog("mp-write sync err: " + String(e).slice(0, 160))
+  }
+}
+
 function initRuntime(client: any): void {
   tuiClient = client || null
   if (runtimeInit) return
   runtimeInit = true
   mkdirSync(OUT_DIR, { recursive: true, mode: 0o700 })
   mkdirSync(HOOK_STATE_DIR, { recursive: true })
+  ensureMpWrite()
   autoInject = isAutoInjectEnabled()
   identity = readIdentity()
   interval = saveInterval()
@@ -1936,6 +2040,23 @@ async function server({ client }: any): Promise<any> {
   initRuntime(client)
 
   return {
+    // Zero-config MCP (same pattern as nguyentamdat/opencode-mempalace):
+    // when the user has no mempalace entry of their own, register ours —
+    // read-only, so no tab can ever hold the writer lease and starve mines.
+    // A manual entry always wins. Runs at host config time, before any MCP
+    // server spawns.
+    config: async (config: any) => {
+      try {
+        if (!config) return
+        if (!config.mcp) config.mcp = {}
+        const { entry, reason } = registerMcpServer(config.mcp.mempalace, resolveMcpBin())
+        if (entry) config.mcp.mempalace = entry
+        log(`mcp auto-register: ${reason}`)
+      } catch (e) {
+        errLog("mcp auto-register err: " + String(e).slice(0, 160))
+      }
+    },
+
     "chat.message": async (input: any, output: any) => {
       const role = (output.message as any).role
       if (role !== "user") return
@@ -2103,6 +2224,32 @@ const mempalaceV2 = PluginV2.define({
   id: "opencode-mempalace-persistence",
   async setup(ctx) {
     initRuntime(null)
+
+    // Zero-config MCP, V2 side (see the V1 `config` hook above for why).
+    // ctx.mcp.transform registers the entry before session MCP servers
+    // spawn — opencode spawns one set per tab, so each tab gets a reader
+    // and no tab can hold the writer lease. Manual entries win, as above.
+    // Defensive throughout: older hosts may lack ctx.mcp entirely, in which
+    // case the manual opencode.jsonc block from the README still applies.
+    try {
+      const mcp = (ctx as any)?.mcp
+      if (mcp && typeof mcp.transform === "function") {
+        await mcp.transform((editor: any) => {
+          try {
+            const res = registerMcpServer(editor?.get?.("mempalace"), resolveMcpBin())
+            if (res.entry) editor.set("mempalace", res.entry)
+            log(`mcp auto-register (v2): ${res.reason}`)
+            ilog("mcp", { autoRegister: res.reason })
+          } catch (e) {
+            errLog("mcp auto-register (v2) err: " + String(e).slice(0, 160))
+          }
+        })
+      } else {
+        log("mcp auto-register: host has no ctx.mcp, skipping (manual entry still works)")
+      }
+    } catch (e) {
+      errLog("mcp auto-register (v2) err: " + String(e).slice(0, 160))
+    }
 
     // Port of V1 "chat.message": count admitted human prompts per session,
     // arm one AI checkpoint per save-interval boundary.
