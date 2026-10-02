@@ -72,12 +72,30 @@ pipx install "mempalace>=3.3.5"
 
 # Create palace
 mempalace init ~/opencode-memory
-
-# Configure MCP
-mempalace mcp
 ```
 
-The `mempalace mcp` command gives you the exact MCP setup string for your configuration.
+Then register the MCP server in `~/.config/opencode/opencode.jsonc` — this is
+what gives the model recall (search, diary reads, knowledge-graph queries).
+The plugin itself only mines via the CLI; without this block there is no
+recall. Note: `mempalace mcp` prints setup commands for Claude Code and Codex
+only, **not** for OpenCode — use this block instead:
+
+```jsonc
+{
+  "plugin": ["opencode-mempalace-persistence"],
+  "mcp": {
+    "mempalace": {
+      "type": "local",
+      "command": ["/home/YOU/.local/bin/mempalace-mcp"],
+      "enabled": true
+    }
+  }
+}
+```
+
+Replace `/home/YOU/.local/bin/mempalace-mcp` with the real path (`which
+mempalace-mcp` — with `uv tool` or `pipx` it is usually
+`~/.local/bin/mempalace-mcp`). Restart OpenCode after editing.
 
 ### 4. Plugin config (all optional)
 
