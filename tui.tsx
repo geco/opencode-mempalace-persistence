@@ -201,7 +201,8 @@ const grouped = (n: number) =>
 //            in practice the mine, MCP writes are a drawer at a time)
 // Line 1 (other states):
 //   ◆ MP queue q6 waiting 146h
-//   ◆ MP blocked q6 waiting 146h palace busy
+//   ◆ MP busy q1 21m
+//   ◆ MP error q1 21m
 //   ◆ MP idle
 //
 // Line 2 is a REAL fraction, not a gauge: completed files over total files
@@ -281,7 +282,12 @@ const line1 = (s: Status, q: Queue): string => {
     const age = q.oldest ? span(q.oldest) : "a while"
     // When the palace is held by another process the queue is not waiting
     // because nothing wants it: it is waiting because it cannot be written.
-    if (s.phase === "busy" || s.error) return `◆ MP blocked q${q.count} waiting ${age} palace busy`
+    // Two distinct causes, two labels, same shape — "busy" is contention
+    // (the lock is held, a later trigger will retry) and "error" is a real
+    // failure worth reading in /memory-log. They used to share one line
+    // ending in "palace busy", which called a genuine error "busy".
+    if (s.phase === "busy") return `◆ MP busy q${q.count} ${age}`
+    if (s.error) return `◆ MP error q${q.count} ${age}`
     return `◆ MP queue q${q.count} waiting ${age}`
   }
   // Idle with nothing queued: last completed run in compact tokens.
