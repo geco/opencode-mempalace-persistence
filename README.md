@@ -444,6 +444,43 @@ Per-FILE completion does not come from the mine: the miner walks the files silen
 
 This is also why per-file mine invocations were considered and dropped: they would buy the same detail at ~56s of startup per file (measured: model load is ~1s of it, the rest is two whole-palace prefetch scans that grow with the palace). The detail is free from metadata; the startup cost is not paid.
 
+#### What it looks like over time
+
+A 10-file run, one frame per footer poll (1s). `█` is files done,
+`▓▓▓` is the sweep (it paints over anything, including filled cells —
+frame 5 shows it wrapping mid-bar), `░` is not yet done:
+
+```
+◆ MP mining 0/10 q10 w1/1 just started +0d
+[▓▓▓░░░░░░░░░░░░░░░░░░░░░]
+
+◆ MP mining 2/10 q8 w1/1 1m +14d
+[█████░░▓▓▓░░░░░░░░░░░░░░]
+
+◆ MP mining 5/10 q5 w1/1 3m +180d
+[████████████░░▓▓▓░░░░░░░]
+
+◆ MP mining 7/10 q3 w1/1 4m +260d
+[█████████████████░░░░▓▓▓]
+
+◆ MP mining 9/10 q1 w1/1 5m +331d
+[████▓▓▓███████████████░░]
+
+◆ MP mining 10/10 q0 w1/1 6m +340d
+[███████████▓▓▓██████████]
+
+◆ MP idle 10fl 1wn - 1m ago +340dr
+[░░░░░░░░░░░░░░░░░░░░░░░░]
+
+◇ MP last search: 2m ago (5 res)
+◆ MP idle 10fl 1wn - 1m ago +340dr
+[░░░░░░░░░░░░░░░░░░░░░░░░]
+```
+
+Then the bar goes dark and stays dark: idle is always an empty bar, and
+"done" is said by the line above. The last frame shows the query row in
+its idle form on top — the two query forms never coexist.
+
 ### The mine outlives opencode
 
 Closing opencode never stops the memory system. On exit the plugin exports what's new and spawns one DETACHED mine per pending wing, then returns immediately — shutdown stays instant no matter how big the backlog is. (The old 45s-budget synchronous mine is gone: it guaranteed failure on any real backlog, 6.6 MB needing 50 minutes.)
