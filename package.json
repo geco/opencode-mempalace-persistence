@@ -39,7 +39,7 @@
   "homepage": "https://github.com/geco/opencode-mempalace-persistence#readme",
   "devDependencies": {
     "@opencode-ai/plugin": "^1.15.0",
-    "@types/node": "^25.8.0",
+    "@types/node": "^26.6.4",
     "typescript": "^6.0.3"
   },
   "dependencies": {
