@@ -1,64 +1,27 @@
 // Regression test for MCP auto-registration (zero-config).
 //
-// The functions under test are extracted from the COMPILED dist/index.js by
-// name (not copied here) so this test cannot drift from what ships.
+// Imports the real functions from the COMPILED dist/index.js (named exports
+// kept for exactly this — no `new Function`, no eval, scanner-clean).
 // Requires `npm run build` first.
 //
 // Cases:
 //  - no manual entry + binary present -> read-only entry with absolute cmd
-//  - manual entry present (even a writer one) -> untouched, never overridden
+//  - manual entry present -> repaired, never merely "respected"
+//  - already-correct entry -> untouched (no churn)
+//  - broken command -> repointed to the working binary
+//  - MEMPALACE_MCP_MANUAL=1 -> fully untouched, even a writer
 //  - no binary anywhere -> no entry, with a reason (never a broken command)
 //  - entry always carries MEMPALACE_MCP_READ_ONLY=1 (the whole point: no tab
 //    may ever hold the writer lease and starve mines)
-import { readFileSync, mkdirSync, writeFileSync, chmodSync, rmSync } from "fs"
+import { mkdirSync, writeFileSync, chmodSync, rmSync } from "fs"
 import { join } from "path"
 import { tmpdir } from "os"
 import { fileURLToPath } from "url"
 
 const ROOT = fileURLToPath(new URL(".", import.meta.url))
-const DIST = join(ROOT, "dist/index.js")
-const src = readFileSync(DIST, "utf-8")
-
-function sliceFn(name) {
-  const start = src.indexOf(`\nfunction ${name}(`)
-  if (start < 0) throw new Error(`function ${name} not found in dist`)
-  let depth = 0
-  for (let i = src.indexOf("{", start); i < src.length; i++) {
-    if (src[i] === "{") depth++
-    else if (src[i] === "}" && --depth === 0) return src.slice(start, i + 1)
-  }
-  throw new Error(`unbalanced braces in ${name}`)
-}
-
-// resolveMcpBin reads process.env + HOME at call time, so scope them per case.
-// It also uses its module-level memo (`let resolvedMcpBin`), redeclared here
-// so every case starts uncached.
-const body =
-  "let resolvedMcpBin;\n" + ["resolveMcpBin", "mcpServerEntry", "registerMcpServer"].map(sliceFn).join("\n\n")
-const factory = new Function(
-  "process",
-  "existsSync",
-  "execSync",
-  "join",
-  "HOME",
-  `${body}\nreturn { resolveMcpBin, mcpServerEntry, registerMcpServer }`,
+const { resolveMcpBin, mcpServerEntry, registerMcpServer } = await import(
+  join(ROOT, "dist/index.js")
 )
-
-const realFs = await import("fs")
-const realCp = await import("child_process")
-// execSync inherits the REAL environment unless told otherwise — force the
-// fixture env through, or PATH-based resolution escapes the sandbox.
-const runWith = (env, home) => {
-  const merged = { ...process.env, ...env }
-  const execSync = (cmd, opts) => realCp.execSync(cmd, { ...opts, env: merged })
-  return factory(
-    { ...process, env: merged, platform: process.platform },
-    realFs.existsSync,
-    execSync,
-    join,
-    home,
-  )
-}
 
 const checks = []
 const check = (name, pass, extra = "") => {
@@ -73,11 +36,11 @@ mkdirSync(fakeBinDir, { recursive: true, mode: 0o700 })
 const fakeBin = join(fakeBinDir, "mempalace-mcp")
 writeFileSync(fakeBin, "#!/bin/sh\nexit 0\n")
 chmodSync(fakeBin, 0o755)
+const fx = (extraEnv = {}) => ({ env: { PATH: "/usr/bin:/bin", ...extraEnv }, home: fakeHome })
 
 // 1. fresh install shape: no entry, binary present -> read-only entry ------
 {
-  const { resolveMcpBin, registerMcpServer } = runWith({}, fakeHome)
-  const bin = resolveMcpBin()
+  const bin = resolveMcpBin(fx())
   check("binary resolved to the fixture", bin === fakeBin, bin)
   const { entry, reason } = registerMcpServer(undefined, bin)
   check("entry produced when none exists", !!entry, reason)
@@ -85,11 +48,12 @@ chmodSync(fakeBin, 0o755)
   check("command is absolute", entry?.command?.[0] === fakeBin, JSON.stringify(entry?.command))
   check("read-only env set", entry?.environment?.MEMPALACE_MCP_READ_ONLY === "1")
   check("enabled", entry?.enabled === true)
+  const direct = mcpServerEntry(fakeBin)
+  check("mcpServerEntry shape", direct.type === "local" && direct.enabled === true)
 }
 
-// 2. manual entry: repaired, not just respected -------------------------------
+// 2. manual entry: repaired, not just respected -----------------------------
 {
-  const { registerMcpServer } = runWith({}, fakeHome)
   // 2a. writer entry without the env -> read-only added, command kept
   const writer = { type: "local", command: [fakeBin], enabled: true }
   const r1 = registerMcpServer(writer, fakeBin)
@@ -107,8 +71,7 @@ chmodSync(fakeBin, 0o755)
   const r3 = registerMcpServer({ type: "local", command: ["mempalace-mcp"], enabled: true }, fakeBin)
   check("broken command repointed", r3.entry?.command?.[0] === fakeBin, r3.reason)
   // 2d. opt-out -> fully untouched, even a writer
-  const { registerMcpServer: regOpt } = runWith({ MEMPALACE_MCP_MANUAL: "1" }, fakeHome)
-  const r4 = regOpt(writer, fakeBin)
+  const r4 = registerMcpServer(writer, fakeBin, { manual: "1" })
   check("MEMPALACE_MCP_MANUAL=1 skips repair", r4.entry === null, r4.reason)
 }
 
@@ -116,12 +79,7 @@ chmodSync(fakeBin, 0o755)
 {
   const emptyHome = join(tmpdir(), `mp-autoreg-empty-${process.pid}`)
   mkdirSync(emptyHome, { recursive: true, mode: 0o700 })
-  // PATH without mempalace-mcp: narrow to dirs that cannot contain it.
-  const { registerMcpServer, resolveMcpBin } = runWith(
-    { PATH: "/usr/bin:/bin", MEMPALACE_MCP_BIN: "" },
-    emptyHome,
-  )
-  const bin = resolveMcpBin()
+  const bin = resolveMcpBin({ env: { PATH: "/usr/bin:/bin", MEMPALACE_MCP_BIN: "" }, home: emptyHome })
   const { entry, reason } = registerMcpServer(undefined, bin)
   check("no binary -> no entry", entry === null && bin === "", `${reason} (bin=${JSON.stringify(bin)})`)
   rmSync(emptyHome, { recursive: true, force: true })
@@ -129,8 +87,8 @@ chmodSync(fakeBin, 0o755)
 
 // 4. MEMPALACE_MCP_BIN override ---------------------------------------------
 {
-  const { resolveMcpBin } = runWith({ MEMPALACE_MCP_BIN: fakeBin }, "/nonexistent-home")
-  check("MEMPALACE_MCP_BIN wins", resolveMcpBin() === fakeBin)
+  const bin = resolveMcpBin({ env: { MEMPALACE_MCP_BIN: fakeBin }, home: "/nonexistent-home" })
+  check("MEMPALACE_MCP_BIN wins", bin === fakeBin)
 }
 
 rmSync(fakeHome, { recursive: true, force: true })

@@ -580,37 +580,49 @@ function resolveBin(): string | null {
 // registering a command that does not exist would break the host's MCP
 // startup, which is worse than no recall.
 let resolvedMcpBin: string | undefined
-function resolveMcpBin(): string {
-  if (resolvedMcpBin !== undefined) return resolvedMcpBin
-  const envBin = (process.env.MEMPALACE_MCP_BIN || "").trim()
-  if (envBin && existsSync(envBin)) {
-    resolvedMcpBin = envBin
-    return resolvedMcpBin
+// Optional overrides exist for tests only: production always calls with no
+// arguments and gets the memoized real environment.
+function resolveMcpBin(opts?: {
+  env?: Record<string, string | undefined>
+  home?: string
+  platform?: string
+}): string {
+  if (!opts && resolvedMcpBin !== undefined) return resolvedMcpBin
+  const env = opts?.env ?? process.env
+  const home = opts?.home ?? HOME
+  const platform = opts?.platform ?? process.platform
+  const done = (v: string): string => {
+    if (!opts) resolvedMcpBin = v
+    return v
   }
-  const spots = [join(HOME, ".local/bin/mempalace-mcp"), "/usr/local/bin/mempalace-mcp"]
+  const envBin = (env.MEMPALACE_MCP_BIN || "").trim()
+  if (envBin && existsSync(envBin)) {
+    return done(envBin)
+  }
+  const spots = [join(home, ".local/bin/mempalace-mcp"), "/usr/local/bin/mempalace-mcp"]
   for (const s of spots) {
     try {
       if (existsSync(s)) {
-        resolvedMcpBin = s
-        return resolvedMcpBin
+        return done(s)
       }
     } catch {}
   }
   try {
-    const found = execSync(process.platform === "win32" ? "where mempalace-mcp" : "command -v mempalace-mcp", {
+    const found = execSync(platform === "win32" ? "where mempalace-mcp" : "command -v mempalace-mcp", {
       encoding: "utf-8",
       timeout: 10000,
+      // Merge, don't replace: a fixture PATH must win without losing the
+      // rest of the environment the shell needs.
+      ...(opts?.env ? { env: { ...process.env, ...opts.env } } : {}),
     })
       .trim()
       .split(/\r?\n/)[0]
       ?.trim()
     if (found) {
-      resolvedMcpBin = found
-      return resolvedMcpBin
+      return done(found)
     }
   } catch {}
-  resolvedMcpBin = ""
-  return resolvedMcpBin
+  return done("")
 }
 
 // The MCP server entry this plugin registers when the user has none.
@@ -639,12 +651,10 @@ function mcpServerEntry(bin: string): Record<string, unknown> {
 function registerMcpServer(
   existing: any,
   bin: string,
+  opts?: { manual?: string },
 ): { entry: Record<string, unknown> | null; reason: string } {
-  if (
-    ["1", "true", "yes", "on"].includes(
-      String(process.env.MEMPALACE_MCP_MANUAL || "").trim().toLowerCase(),
-    )
-  )
+  const manual = opts && "manual" in opts ? opts.manual : process.env.MEMPALACE_MCP_MANUAL
+  if (["1", "true", "yes", "on"].includes(String(manual || "").trim().toLowerCase()))
     return { entry: null, reason: "MEMPALACE_MCP_MANUAL=1, manual entry untouched" }
   if (!existing) {
     if (!bin) return { entry: null, reason: "mempalace-mcp binary not found, skipping registration" }
@@ -2430,3 +2440,18 @@ const mempalaceV2 = PluginV2.define({
 // Dual entrypoint: V2 calls setup(), V1 (>= 1.18.29) calls server().
 // The V1 hook implementation above is untouched, so opencode-v1 keeps working.
 export default { ...mempalaceV2, server }
+
+// Named exports for the regression tests only (test-autoreg-mcp.mjs,
+// test-reap-detached.mjs import them from dist). The host uses the default
+// export and ignores these. Exporting instead of `new Function` keeps the
+// security scanner clean: no dynamic code execution anywhere in the repo.
+export {
+  resolveMcpBin,
+  mcpServerEntry,
+  registerMcpServer,
+  procArgv,
+  procState,
+  procAlive,
+  procParent,
+  reapDetachedMines,
+}

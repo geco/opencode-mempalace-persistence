@@ -1,10 +1,10 @@
 // Regression test for reapDetachedMines(): stale detached mines from previous
 // opencode sessions must be terminated on startup, and ONLY those.
 //
-// The functions under test are extracted from the COMPILED dist/index.js by
-// name (not copied here) so this test cannot drift from what ships. Requires
-// `npm run build` first. Linux-only: it reads /proc, which is also the only
-// platform the reap acts on.
+// Imports the real function from the COMPILED dist/index.js (named export
+// kept for exactly this — no `new Function`, no eval, scanner-clean).
+// Requires `npm run build` first. Linux-only: it reads /proc, which is also
+// the only platform the reap acts on.
 //
 // Cases:
 //  - orphan wrapper (ppid 1) is killed, and its child (the python mine that
@@ -29,25 +29,7 @@ if (!existsSync(DIST)) {
   process.exit(1)
 }
 
-const src = readFileSync(DIST, "utf-8")
-function sliceFn(name) {
-  const start = src.indexOf(`\nfunction ${name}(`)
-  if (start < 0) throw new Error(`function ${name} not found in dist`)
-  let depth = 0
-  for (let i = src.indexOf("{", start); i < src.length; i++) {
-    if (src[i] === "{") depth++
-    else if (src[i] === "}" && --depth === 0) return src.slice(start, i + 1)
-  }
-  throw new Error(`unbalanced braces in ${name}`)
-}
-const body = ["procArgv", "procState", "procAlive", "procParent", "reapDetachedMines"].map(sliceFn).join("\n\n")
-const reapDetachedMines = new Function(
-  "readFileSync",
-  "readdirSync",
-  "existsSync",
-  "process",
-  `${body}\nreturn reapDetachedMines`,
-)(readFileSync, readdirSync, existsSync, process)
+const { reapDetachedMines } = await import(DIST)
 
 // --- fixtures in a throwaway dir -----------------------------------------
 const dir = join(tmpdir(), `mp-reap-${process.pid}`)
