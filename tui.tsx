@@ -242,7 +242,16 @@ const barLine = (s: Status, tick: number): string => {
   // across versions, and overshooting wraps and breaks the layout. The caps
   // make fullness unambiguous at any width instead: a full bar touches both
   // ends, which is what "is it full or not" actually needed.
-  return `[${cells.join("")}]`
+  //
+  // After the closing bracket, the loaded plugin version (` v4.0.0`),
+  // parsed from status.json's `plugin` field ("name vX.Y.Z") which the
+  // server already writes. Same answer as the startup toast and `opencode
+  // plugin list`, but always visible — npm-cache vs local build is never a
+  // mystery. Omitted when unparseable rather than invented; 26 + 1 + 6 = 33
+  // columns worst case, still inside the 42 default.
+  const m = typeof s.plugin === "string" ? /v(\d+\.\d+\.\d+)/.exec(s.plugin) : null
+  const ver = m ? ` v${m[1]}` : ""
+  return `[${cells.join("")}]${ver}`
 }
 
 const line1 = (s: Status, q: Queue): string => {

@@ -418,7 +418,7 @@ The plugin ships a second entry point, `tui.tsx`, that claims the sidebar footer
 
 ```
 ◆ MP mining 4/10 q8 w2/2 6m +1,240d
-[██████████▓▓▓░░░░░░░░░░░░░]
+[██████████▓▓▓░░░░░░░░░░░░░] v4.0.0
 ```
 
 Two lines. Line 1 is compact tokens: `◆` semaphore (green idle, blue mining, yellow queue/busy, red error), `MP` tag, phase, files completed over files in the current wing (`4/10`, bare — the q- and w- prefixes mark the other counters), files queued live (`q8`), wing over wings (`w2/2`, always shown — `w1/1` confirms the run was scoped), elapsed of this run (`6m`), drawers gained (`+1,240d`, single-letter unit like the rest). While backed off waiting for the lock the frozen counters drop out and only the clock stays: `◆ MP mining w2/2 6m waiting`. No holder, no pid — on a transient holder a pid is already dead when you read it, on a stuck one it is in `/memory-log` where it belongs. Other states: `◆ MP queue q6 waiting 146h` (nothing has tried yet), `◆ MP busy q1 21m` (a mine gave up: the lock was held, a later trigger retries), `◆ MP error q1 21m` (a real failure — read `/memory-log`), and idle with the last completed run (`◆ MP idle 9fl 2wn - 25m ago +1,240dr`, persisted across restarts — or plain `◆ MP idle` with no recorded run).
@@ -439,7 +439,7 @@ With no query running, the same row shows the last completed read, if any (muted
 
 Tool, age and result count (parsed from the result's `results` array; omitted when unparseable rather than invented). Session-scoped, not persisted: after a restart there is no last search until the first one.
 
-Line 2 is a REAL fraction — completed files over total files of the run, queued arrivals included — not a gauge. What the bar shows is **queue depth, not progress** is over: the old gauge filled with the queue and could never drain visually. A percentage was tried first and was wrong (`mempalace mine` is a black box: no total to divide by, so an animated 0→100 loop read as a job stuck at 99%). A fraction of files is exact; a percentage of "done" would be invented. The `▓▓▓` window sweeps while mining so a slow batch (minutes between commits) still looks alive. Idle the bar always sits empty — even with nothing queued, where a full bar read as garish: "done" is said by the idle line (last run summary below), and the accent-colored fill is then unmistakably the "executing" state.
+Line 2 is a REAL fraction — completed files over total files of the run, queued arrivals included — not a gauge. What the bar shows is **queue depth, not progress** is over: the old gauge filled with the queue and could never drain visually. A percentage was tried first and was wrong (`mempalace mine` is a black box: no total to divide by, so an animated 0→100 loop read as a job stuck at 99%). A fraction of files is exact; a percentage of "done" would be invented. The `▓▓▓` window sweeps while mining so a slow batch (minutes between commits) still looks alive. Idle the bar always sits empty — even with nothing queued, where a full bar read as garish: "done" is said by the idle line (last run summary below), and the accent-colored fill is then unmistakably the "executing" state. After the closing bracket, the loaded plugin version (` v4.0.0`, parsed from the status file the server already writes) — same answer as the startup toast, always visible.
 
 Per-FILE completion does not come from the mine: the miner walks the files silently (`for i, filepath in enumerate(files, 1)` — it knows, it just never says) and only the final summary reports. It comes from the palace instead: every filed drawer records its `source_file` plus the file's `chunk_total`, so intersecting the wing directory with the filed set tells exactly which files are done — with zero mine overhead. A read-only `COUNT(*)` plus one grouped metadata query, polled every 3s while a mine runs. Anything unreadable degrades to elapsed-time-only.
 
@@ -453,29 +453,29 @@ frame 5 shows it wrapping mid-bar), `░` is not yet done:
 
 ```
 ◆ MP mining 0/10 q10 w1/1 just started +0d
-[▓▓▓░░░░░░░░░░░░░░░░░░░░░]
+[▓▓▓░░░░░░░░░░░░░░░░░░░░░] v4.0.0
 
 ◆ MP mining 2/10 q8 w1/1 1m +14d
-[█████░░▓▓▓░░░░░░░░░░░░░░]
+[█████░░▓▓▓░░░░░░░░░░░░░░] v4.0.0
 
 ◆ MP mining 5/10 q5 w1/1 3m +180d
-[████████████░░▓▓▓░░░░░░░]
+[████████████░░▓▓▓░░░░░░░] v4.0.0
 
 ◆ MP mining 7/10 q3 w1/1 4m +260d
-[█████████████████░░░░▓▓▓]
+[█████████████████░░░░▓▓▓] v4.0.0
 
 ◆ MP mining 9/10 q1 w1/1 5m +331d
-[████▓▓▓███████████████░░]
+[████▓▓▓███████████████░░] v4.0.0
 
 ◆ MP mining 10/10 q0 w1/1 6m +340d
-[███████████▓▓▓██████████]
+[███████████▓▓▓██████████] v4.0.0
 
 ◆ MP idle 10fl 1wn - 1m ago +340dr
-[░░░░░░░░░░░░░░░░░░░░░░░░]
+[░░░░░░░░░░░░░░░░░░░░░░░░] v4.0.0
 
 ◇ MP last search: 2m ago (5 res)
 ◆ MP idle 10fl 1wn - 1m ago +340dr
-[░░░░░░░░░░░░░░░░░░░░░░░░]
+[░░░░░░░░░░░░░░░░░░░░░░░░] v4.0.0
 ```
 
 Then the bar goes dark and stays dark: idle is always an empty bar, and
